@@ -1173,11 +1173,13 @@ class KvmBackend extends BackendBase {
                 `vhost-user-fs-pci,chardev=virtiofs,tag=${HOME_SHARE_MOUNT_TAG}`,
             );
         } else if (this.homeShareType === '9p') {
-            // virtio-9p: built into QEMU, no daemon, works unprivileged
+            // virtio-9p: built into QEMU, no daemon, works unprivileged.
+            // security_model=none: like passthrough but ignores chown
+            // failures — designed for unprivileged QEMU operation.
             qemuArgs.push(
                 '-virtfs',
                 `local,path=${os.homedir()},mount_tag=${HOME_SHARE_MOUNT_TAG}` +
-                ',security_model=mapped-xattr,id=hostshare',
+                ',security_model=none,id=hostshare',
             );
         }
 
