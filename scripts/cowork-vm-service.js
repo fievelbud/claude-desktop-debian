@@ -1039,10 +1039,35 @@ class KvmBackend extends BackendBase {
             );
         }
 
-        // Disk
+        // Disk (rootfs overlay → /dev/vda)
         qemuArgs.push(
             '-drive', `file=${overlayPath},format=qcow2,if=virtio`
         );
+
+        // Session disk (→ /dev/vdb, formatted by guest sdk-daemon)
+        const sessionDiskPath = path.join(this.sessionDir, 'sessiondata.qcow2');
+        try {
+            execFileSync('qemu-img', [
+                'create', '-f', 'qcow2', sessionDiskPath, '2G'
+            ], { stdio: 'pipe' });
+            qemuArgs.push(
+                '-drive', `file=${sessionDiskPath},format=qcow2,if=virtio`
+            );
+            log(`KvmBackend: session disk created at ${sessionDiskPath}`);
+        } catch (e) {
+            logError('KvmBackend: session disk creation failed:', e.message);
+        }
+
+        // smol-bin disk (contains SDK binaries → /dev/vdc, detected by guest via blkid)
+        const smolBinPath = path.join(VM_BASE_DIR, 'smol-bin.qcow2');
+        if (fs.existsSync(smolBinPath)) {
+            qemuArgs.push(
+                '-drive', `file=${smolBinPath},format=qcow2,if=virtio,readonly=on`
+            );
+            log(`KvmBackend: smol-bin attached from ${smolBinPath}`);
+        } else {
+            logError('KvmBackend: smol-bin.qcow2 not found — guest sdk-daemon will fail');
+        }
 
         // vsock
         qemuArgs.push(
