@@ -870,11 +870,12 @@ class BwrapBackend extends LocalBackend {
 const VM_BASE_DIR = path.join(os.homedir(), '.local/share/claude-desktop/vm');
 const VM_SESSION_DIR = path.join(VM_BASE_DIR, 'sessions');
 const VSOCK_GUEST_PORT = 51234;  // 0xC822 — matches guest sdk-daemon
+const VIRTIOFS_GUEST_MOUNT = '/mnt/.virtiofs-root';
 const QMP_CAPABILITIES = JSON.stringify({ execute: 'qmp_capabilities' });
 
 /** Event types forwarded from the guest sdk-daemon to subscribers. */
 const FORWARDED_EVENTS = new Set([
-    'stdout', 'stderr', 'exit', 'networkStatus', 'apiReachability',
+    'stdout', 'stderr', 'exit', 'networkStatus', 'apiReachability', 'ready',
 ]);
 
 class KvmBackend extends BackendBase {
@@ -980,8 +981,8 @@ class KvmBackend extends BackendBase {
         const initrdPath = path.join(VM_BASE_DIR, 'initrd');
 
         // Start virtiofsd for home directory share (if available)
+        const virtiofsSock = path.join(this.sessionDir, 'virtiofs.sock');
         try {
-            const virtiofsSock = path.join(this.sessionDir, 'virtiofs.sock');
             this.virtiofsdProcess = spawnProcess('virtiofsd', [
                 `--socket-path=${virtiofsSock}`,
                 '-o', `source=${os.homedir()}`,
@@ -994,15 +995,35 @@ class KvmBackend extends BackendBase {
                 this.virtiofsdProcess = null;
             });
             log(`KvmBackend: virtiofsd started, socket=${virtiofsSock}`);
+
+            // Wait for virtiofsd to create its socket before starting QEMU
+            const vfsWaitStart = Date.now();
+            while (!fs.existsSync(virtiofsSock) && Date.now() - vfsWaitStart < 5000) {
+                await new Promise(r => setTimeout(r, 100));
+            }
+            if (fs.existsSync(virtiofsSock)) {
+                log(`KvmBackend: virtiofsd socket ready (${Date.now() - vfsWaitStart}ms)`);
+            } else {
+                logError('KvmBackend: virtiofsd socket not ready after 5s, proceeding without virtiofs');
+                this.virtiofsdProcess.kill();
+                this.virtiofsdProcess = null;
+            }
         } catch (e) {
             log(`KvmBackend: virtiofsd not available: ${e.message}`);
             this.virtiofsdProcess = null;
         }
 
         // Build QEMU arguments
+        // When virtiofs is used, QEMU requires shared memory backend for
+        // vhost-user-fs-pci. Use memory-backend-memfd with share=on.
+        const useSharedMem = !!this.virtiofsdProcess;
         const qemuArgs = [
             '-enable-kvm',
-            '-m', `${memoryGB}G`,
+            ...(useSharedMem
+                ? ['-object', `memory-backend-memfd,id=mem,size=${memoryGB}G,share=on`,
+                   '-numa', 'node,memdev=mem',
+                   '-m', `${memoryGB}G`]
+                : ['-m', `${memoryGB}G`]),
             '-cpu', 'host',
             '-smp', String(cpuCount),
             '-nographic',
@@ -1019,10 +1040,35 @@ class KvmBackend extends BackendBase {
             );
         }
 
-        // Disk
+        // Disk (rootfs overlay → /dev/vda)
         qemuArgs.push(
             '-drive', `file=${overlayPath},format=qcow2,if=virtio`
         );
+
+        // Session disk (→ /dev/vdb, formatted by guest sdk-daemon)
+        const sessionDiskPath = path.join(this.sessionDir, 'sessiondata.qcow2');
+        try {
+            execFileSync('qemu-img', [
+                'create', '-f', 'qcow2', sessionDiskPath, '2G'
+            ], { stdio: 'pipe' });
+            qemuArgs.push(
+                '-drive', `file=${sessionDiskPath},format=qcow2,if=virtio`
+            );
+            log(`KvmBackend: session disk created at ${sessionDiskPath}`);
+        } catch (e) {
+            logError('KvmBackend: session disk creation failed:', e.message);
+        }
+
+        // smol-bin disk (contains SDK binaries → /dev/vdc, detected by guest via blkid)
+        const smolBinPath = path.join(VM_BASE_DIR, 'smol-bin.qcow2');
+        if (fs.existsSync(smolBinPath)) {
+            qemuArgs.push(
+                '-drive', `file=${smolBinPath},format=qcow2,if=virtio,readonly=on`
+            );
+            log(`KvmBackend: smol-bin attached from ${smolBinPath}`);
+        } else {
+            logError('KvmBackend: smol-bin.qcow2 not found — guest sdk-daemon will fail');
+        }
 
         // vsock
         qemuArgs.push(
@@ -1042,10 +1088,9 @@ class KvmBackend extends BackendBase {
 
         // virtiofs char device (if virtiofsd is running)
         if (this.virtiofsdProcess) {
-            const virtiofsSock = path.join(this.sessionDir, 'virtiofs.sock');
             qemuArgs.push(
                 '-chardev', `socket,id=virtiofs,path=${virtiofsSock}`,
-                '-device', 'vhost-user-fs-pci,chardev=virtiofs,tag=hostshare',
+                '-device', 'vhost-user-fs-pci,chardev=virtiofs,tag=claudeshared',
             );
         }
 
@@ -1218,15 +1263,25 @@ class KvmBackend extends BackendBase {
             this._guestBuffer = parsed.remaining;
             const msg = parsed.message;
 
+            // Log all guest messages as decoded JSON for debugging
+            log('KvmBackend: guest message:', JSON.stringify(msg).substring(0, 500));
+
             if (FORWARDED_EVENTS.has(msg.type)) {
                 this.emitEvent(msg);
-            } else if (msg.success !== undefined) {
+            } else if (msg.type === 'event' && FORWARDED_EVENTS.has(msg.event)) {
+                // Guest sends {type:"event", event:"networkStatus", params:{...}}
+                this.emitEvent({ type: msg.event, ...msg.params });
+            } else if (msg.type === 'response' || msg.success !== undefined) {
                 // Response to a request we sent — route to pending callback
+                // Guest sends {type:"response", id:"1", result:{success:true}}
+                if (msg.error) {
+                    log(`KvmBackend: guest response ERROR for id=${msg.id}:`, JSON.stringify(msg.error));
+                }
                 if (this._pendingCallbacks && msg.id !== undefined) {
                     const cb = this._pendingCallbacks.get(String(msg.id));
                     if (cb) {
                         this._pendingCallbacks.delete(String(msg.id));
-                        cb(msg);
+                        cb(msg.result || msg);
                     }
                 }
             } else {
@@ -1298,6 +1353,19 @@ class KvmBackend extends BackendBase {
         });
     }
 
+    async _ensureSdkInstalled() {
+        if (!this._pendingSdkInstall || !this.guestConnected) return;
+        try {
+            log('KvmBackend: installing SDK in guest');
+            await this._forwardToGuest({
+                method: 'installSdk', params: this._pendingSdkInstall
+            });
+            this._pendingSdkInstall = null;
+        } catch (e) {
+            log(`KvmBackend: installSdk forward failed: ${e.message}`);
+        }
+    }
+
     _forwardToGuest(request) {
         return new Promise((resolve, reject) => {
             if (!this._guestConn || !this.guestConnected) {
@@ -1326,7 +1394,10 @@ class KvmBackend extends BackendBase {
             });
 
             try {
-                writeMessage(this._guestConn, request);
+                // Guest expects {type:"request", method:..., params:..., id:...}
+                const wireMsg = { type: 'request', ...request };
+                log('KvmBackend: forwarding to guest:', JSON.stringify(wireMsg).substring(0, 200));
+                writeMessage(this._guestConn, wireMsg);
             } catch (err) {
                 clearTimeout(timer);
                 this._pendingCallbacks.delete(request.id);
@@ -1418,6 +1489,9 @@ class KvmBackend extends BackendBase {
         const { id } = params;
         log(`KvmBackend spawn: id=${id}, forwarding to guest`);
 
+        // Ensure SDK is installed in the guest before spawning
+        await this._ensureSdkInstalled();
+
         try {
             const result = await this._forwardToGuest({
                 method: 'spawn', params
@@ -1453,10 +1527,18 @@ class KvmBackend extends BackendBase {
     }
 
     async writeStdin(params) {
+        // Guest RPC treats stdin as a notification (fire-and-forget),
+        // not a request. Sending as type:"request" returns "unknown method".
+        if (!this._guestConn || !this.guestConnected) {
+            log('KvmBackend: writeStdin: guest not connected');
+            return {};
+        }
         try {
-            await this._forwardToGuest({ method: 'writeStdin', params });
+            writeMessage(this._guestConn, {
+                type: 'notification', method: 'stdin', params,
+            });
         } catch (e) {
-            log(`KvmBackend: writeStdin forward failed: ${e.message}`);
+            log(`KvmBackend: writeStdin failed: ${e.message}`);
         }
         return {};
     }
@@ -1472,7 +1554,7 @@ class KvmBackend extends BackendBase {
 
         if (this.virtiofsdProcess) {
             // virtiofs is active — guest can access host files via mount
-            const guestPath = path.join('/mnt/host', subpath || '');
+            const guestPath = path.join(VIRTIOFS_GUEST_MOUNT, subpath || '');
             return { guestPath };
         }
 
@@ -1518,7 +1600,21 @@ class KvmBackend extends BackendBase {
         const resolved = resolveSdkBinary(
             sdkSubpath, version, 'KvmBackend'
         );
-        if (resolved) this.sdkBinaryPath = resolved;
+        if (resolved) {
+            this.sdkBinaryPath = resolved;
+            // Compute the guest-side path via virtiofs mount
+            const homeDir = os.homedir();
+            const relPath = path.relative(homeDir, resolved);
+            this.guestSdkPath = path.join(VIRTIOFS_GUEST_MOUNT, relPath);
+            log(`KvmBackend: guest SDK path: ${this.guestSdkPath}`);
+        }
+        // Forward to guest so it can prepare the SDK (or defer until spawn)
+        this._pendingSdkInstall = params;
+        if (this.guestConnected) {
+            await this._ensureSdkInstalled();
+        } else {
+            log('KvmBackend: guest not connected yet, will install SDK before spawn');
+        }
         return {};
     }
 
