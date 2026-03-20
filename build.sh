@@ -9,6 +9,7 @@
 architecture=''
 distro_family=''  # debian, rpm, nix, or unknown
 claude_download_url=''
+claude_exe_sha256=''
 claude_exe_filename=''
 version=''
 release_tag=''  # Optional release tag (e.g., v1.3.2+claude1.1.799) for unique package versions
@@ -60,6 +61,31 @@ section_footer() {
 	echo -e "\033[1;36m--- End $1 ---\033[0m"
 }
 
+verify_sha256() {
+	local file_path="$1"
+	local expected_hash="$2"
+	local label="${3:-file}"
+
+	if [[ -z $expected_hash ]]; then
+		echo "Warning: No SHA-256 hash for ${label}," \
+			'skipping verification' >&2
+		return 0
+	fi
+
+	echo "Verifying SHA-256 checksum for ${label}..."
+	local actual_hash
+	actual_hash=$(sha256sum "$file_path" | awk '{print $1}')
+
+	if [[ $actual_hash != "$expected_hash" ]]; then
+		echo "SHA-256 mismatch for ${label}!" >&2
+		echo "  Expected: $expected_hash" >&2
+		echo "  Actual:   $actual_hash" >&2
+		return 1
+	fi
+
+	echo "SHA-256 verified: ${label}"
+}
+
 #===============================================================================
 # Setup Functions
 #===============================================================================
@@ -78,12 +104,14 @@ detect_architecture() {
 	case "$raw_arch" in
 		x86_64)
 			claude_download_url='https://downloads.claude.ai/releases/win32/x64/1.1.7464/Claude-2809b60543935626ef2d64d6bed0988205948463.exe'
+			claude_exe_sha256=''
 			architecture='amd64'
 			claude_exe_filename='Claude-Setup-x64.exe'
 			echo 'Configured for amd64 (x86_64) build.'
 			;;
 		aarch64)
 			claude_download_url='https://downloads.claude.ai/releases/win32/arm64/1.1.7464/Claude-2809b60543935626ef2d64d6bed0988205948463.exe'
+			claude_exe_sha256=''
 			architecture='arm64'
 			claude_exe_filename='Claude-Setup-arm64.exe'
 			echo 'Configured for arm64 (aarch64) build.'
@@ -420,6 +448,22 @@ setup_nodejs() {
 		exit 1
 	fi
 
+	# Verify against official Node.js checksums
+	local shasums_url node_expected_sha256
+	shasums_url="https://nodejs.org/dist/v${node_version_to_install}/SHASUMS256.txt"
+	node_expected_sha256=$(
+		wget -qO- "$shasums_url" \
+			| grep "$node_tarball" \
+			| awk '{print $1}'
+	) || true
+
+	if ! verify_sha256 "$work_dir/$node_tarball" \
+		"$node_expected_sha256" 'Node.js tarball'; then
+		echo 'Node.js integrity check failed!' >&2
+		cd "$project_root" || exit 1
+		exit 1
+	fi
+
 	echo 'Extracting Node.js...'
 	if ! tar -xf "$node_tarball"; then
 		echo 'Failed to extract Node.js tarball' >&2
@@ -528,6 +572,12 @@ download_claude_installer() {
 			exit 1
 		fi
 		echo "Download complete: $claude_exe_filename"
+
+		if ! verify_sha256 "$claude_exe_path" \
+			"$claude_exe_sha256" 'Claude Desktop installer'; then
+			echo 'Download integrity check failed!' >&2
+			exit 1
+		fi
 	fi
 
 	echo "Extracting resources from $claude_exe_filename into separate directory..."

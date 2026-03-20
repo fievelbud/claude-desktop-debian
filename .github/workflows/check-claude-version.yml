@@ -159,7 +159,7 @@ jobs:
             sed -i "s|$ESCAPED_CURRENT|$ESCAPED_NEW|g" build.sh
           fi
 
-          echo "Updated build.sh:"
+          echo "Updated build.sh URLs:"
           grep "claude_download_url=" build.sh
 
       - name: Compute SRI hashes for Nix
@@ -173,17 +173,46 @@ jobs:
           # produce a valid-looking but wrong SRI hash.
           amd64_tmp=$(mktemp)
           curl -fsSL -o "$amd64_tmp" "$AMD64_URL" || { echo "AMD64 download failed"; exit 1; }
-          AMD64_HASH=$(sha256sum "$amd64_tmp" | awk '{print $1}' | xxd -r -p | base64 -w0)
+          AMD64_HEX=$(sha256sum "$amd64_tmp" | awk '{print $1}')
+          AMD64_HASH=$(echo "$AMD64_HEX" | xxd -r -p | base64 -w0)
           rm "$amd64_tmp"
           echo "amd64_sri=sha256-$AMD64_HASH" >> $GITHUB_OUTPUT
+          echo "amd64_sha256=$AMD64_HEX" >> $GITHUB_OUTPUT
 
           if [ -n "$ARM64_URL" ]; then
             arm64_tmp=$(mktemp)
             curl -fsSL -o "$arm64_tmp" "$ARM64_URL" || { echo "ARM64 download failed"; exit 1; }
-            ARM64_HASH=$(sha256sum "$arm64_tmp" | awk '{print $1}' | xxd -r -p | base64 -w0)
+            ARM64_HEX=$(sha256sum "$arm64_tmp" | awk '{print $1}')
+            ARM64_HASH=$(echo "$ARM64_HEX" | xxd -r -p | base64 -w0)
             rm "$arm64_tmp"
             echo "arm64_sri=sha256-$ARM64_HASH" >> $GITHUB_OUTPUT
+            echo "arm64_sha256=$ARM64_HEX" >> $GITHUB_OUTPUT
           fi
+
+      - name: Update build.sh SHA-256 checksums
+        if: steps.check_update.outputs.update_needed == 'true'
+        run: |
+          AMD64_SHA256="${{ steps.nix_hashes.outputs.amd64_sha256 }}"
+          ARM64_SHA256="${{ steps.nix_hashes.outputs.arm64_sha256 }}"
+
+          echo "Updating build.sh SHA-256 checksums..."
+
+          # Update AMD64 hash (in x86_64 case block)
+          if [ -n "$AMD64_SHA256" ]; then
+            sed -i "/x86_64)/,/;;/{
+              s/claude_exe_sha256='[^']*'/claude_exe_sha256='$AMD64_SHA256'/
+            }" build.sh
+          fi
+
+          # Update ARM64 hash (in aarch64 case block)
+          if [ -n "$ARM64_SHA256" ]; then
+            sed -i "/aarch64)/,/;;/{
+              s/claude_exe_sha256='[^']*'/claude_exe_sha256='$ARM64_SHA256'/
+            }" build.sh
+          fi
+
+          echo "Updated build.sh checksums:"
+          grep "claude_exe_sha256=" build.sh
 
       - name: Update Nix package
         if: steps.check_update.outputs.update_needed == 'true'
