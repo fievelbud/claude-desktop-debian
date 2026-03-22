@@ -45,6 +45,19 @@ Use this when you're not confident enough to triage automatically. Examples: sec
 
 ---
 
+## INVESTIGATION RULES
+
+### Check our patches FIRST
+This project patches upstream code extensively. For bugs in patched areas (cowork, tray, frame, platform checks, window decorations), ALWAYS check whether OUR `build.sh` patches could be the cause BEFORE blaming upstream. Read the relevant `patch_` function in `build.sh` and trace what it modifies. A bug may be caused by our patch being stale, incomplete, or wrong — not by the upstream code itself.
+
+### Verify before stating
+Only state facts you verified by reading actual code or running commands. Never claim code exists, functions behave a certain way, or patterns match without finding them in the source. If you cannot find evidence, say so explicitly rather than speculating.
+
+### Validate network assumptions
+For download, CDN, or network-related issues, use `curl` to verify URLs actually exist before speculating about failures. Check HTTP status codes rather than assuming 404 or success.
+
+---
+
 ## INVESTIGATION GUIDANCE
 
 When investigating bugs, search these files based on the issue category:

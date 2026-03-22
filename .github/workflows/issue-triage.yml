@@ -338,8 +338,11 @@ jobs:
           The beautified reference source (upstream app.asar) is at /tmp/ref-source/app-extracted/.
           Key files: .vite/build/index.js (main process), .vite/build/mainWindow.js, .vite/build/mainView.js.
 
+          ## Project Documentation
           CONTEXT
+            cat CLAUDE.md
             cat << 'BODY'
+
           ## How This Project Patches Upstream Code
           IMPORTANT: All fixes to the upstream JavaScript are applied via sed/regex in build.sh.
           Variable and function names are MINIFIED and change between releases.
@@ -348,6 +351,28 @@ jobs:
           See build.sh for examples of existing patches (search for patch_ functions).
           The wrapper files (frame-fix-wrapper.js, frame-fix-entry.js) intercept require('electron')
           and can patch BrowserWindow defaults without touching minified code.
+
+          ## Investigation Rules
+
+          ### Check our patches FIRST
+          This project patches upstream code extensively. For bugs in patched areas
+          (cowork, tray, frame, platform checks, window decorations), ALWAYS check
+          whether OUR build.sh patches could be the cause BEFORE blaming upstream.
+          Read the relevant patch_ function in build.sh and trace what it modifies.
+          A bug may be caused by our patch being stale, incomplete, or wrong — not
+          by the upstream code itself.
+
+          ### Verify before stating
+          Only state facts you verified by reading actual code or running commands.
+          Never claim code exists, functions behave a certain way, or patterns match
+          without finding them in the source. If you cannot find evidence, say so
+          explicitly rather than speculating.
+
+          ### Validate network assumptions
+          For download, CDN, or network-related issues, use curl to verify URLs
+          actually exist before speculating about failures. For example:
+            curl -sI "https://example.com/file" | head -5
+          Check HTTP status codes rather than assuming 404 or success.
 
           ## Output Format
           Structure your response in these sections:
@@ -376,7 +401,7 @@ jobs:
           investigation=$(claude -p "$(cat /tmp/investigate-prompt.txt)" \
             --dangerously-skip-permissions \
             --model claude-sonnet-4-6 \
-            --max-budget-usd 1.00 \
+            --max-budget-usd 3.00 \
             2>/dev/null) || {
               echo "::warning::Investigation failed"
               echo "has_findings=false" >> "$GITHUB_OUTPUT"
