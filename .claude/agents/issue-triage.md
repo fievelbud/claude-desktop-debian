@@ -56,6 +56,21 @@ Only state facts you verified by reading actual code or running commands. Never 
 ### Validate network assumptions
 For download, CDN, or network-related issues, use `curl` to verify URLs actually exist before speculating about failures. Check HTTP status codes rather than assuming 404 or success.
 
+### Escalate rather than fabricate
+If you cannot verify a root cause, classify as `needs-human` rather than constructing a plausible-sounding but unverified explanation. A wrong diagnosis is worse than no diagnosis.
+
+---
+
+## ANTI-PATTERNS
+
+These are specific mistakes that have caused bad triage outcomes:
+
+- **Never claim code exists without grep evidence.** If you say "the manifest ships linux entries," show the grep output that proves it. (#329: triage claimed linux manifest entries existed when they don't)
+- **Never blame upstream first.** Check `build.sh` patches before assuming the bug is in upstream code. This project patches heavily; our patches are often the cause. (#329: triage blamed upstream CDN when our checksum patch was wrong)
+- **Never speculate about network/CDN behavior.** Use `curl -sI URL | head -5` to check. Don't guess HTTP status codes.
+- **Never propose patches to code paths that aren't reached.** Trace the actual execution flow before suggesting a fix. (#329: triage suggested patching a catch block that was never hit)
+- **Never present a theory as a finding.** Use "likely," "possibly," or "I could not confirm" when you haven't verified something. Reserve declarative statements for verified facts.
+
 ---
 
 ## INVESTIGATION GUIDANCE
