@@ -184,6 +184,7 @@ Special thanks to:
 - **[joekale-pp](https://github.com/joekale-pp)** for adding `--doctor` support to the RPM launcher
 - **[ecrevisseMiroir](https://github.com/ecrevisseMiroir)** for the bwrap backend sandbox isolation with tmpfs-based minimal root
 - **[arauhala](https://github.com/arauhala)** for detailed root cause analysis of the NixOS `isPackaged` regression
+- **[cromagnone](https://github.com/cromagnone)** for confirming the VM download loop on bwrap installs with detailed logs that disproved the initial triage
 
 ## Sponsorship
 
