@@ -4,6 +4,12 @@
 
 This project repackages Claude Desktop (Electron app) for Debian/Ubuntu Linux, applying necessary patches for Linux compatibility.
 
+## Learnings
+
+The [`docs/learnings/`](docs/learnings/) directory contains hard-won technical knowledge from debugging and fixing issues — things that aren't obvious from reading the code or docs alone. Consult these before working on related areas. Add new entries when you discover something non-obvious that would save future contributors (human or AI) significant time.
+
+- [`nix.md`](docs/learnings/nix.md) — NixOS packaging, Electron resource path resolution, testing without NixOS
+
 ## Code Style
 
 All shell scripts in this project must follow the [Bash Style Guide](STYLEGUIDE.md). Key points:
@@ -370,6 +376,30 @@ gdbus call --session --dest=org.freedesktop.DBus \
 - Logs: `~/.config/Claude/logs/`
 - SingletonLock: `~/.config/Claude/SingletonLock`
 - Launcher log: `~/.cache/claude-desktop-debian/launcher.log`
+
+## Versioning
+
+Release versions are managed via two GitHub Actions repository variables (not files):
+
+- **`REPO_VERSION`** - The project's own version (e.g., `1.3.23`). Bump this manually via `gh variable set REPO_VERSION --body "X.Y.Z"` when shipping project changes.
+- **`CLAUDE_DESKTOP_VERSION`** - The upstream Claude Desktop version (e.g., `1.1.8629`). Updated automatically by the `check-claude-version` workflow when a new upstream release is detected.
+
+### Tag format
+
+Tags follow the pattern `v{REPO_VERSION}+claude{CLAUDE_DESKTOP_VERSION}`, e.g., `v1.3.23+claude1.1.7714`. Pushing a tag triggers the CI release build.
+
+```bash
+# Check current values
+gh variable get REPO_VERSION
+gh variable get CLAUDE_DESKTOP_VERSION
+
+# Bump repo version and tag a release
+gh variable set REPO_VERSION --body "1.3.24"
+git tag "v1.3.24+claude$(gh variable get CLAUDE_DESKTOP_VERSION)"
+git push origin "v1.3.24+claude$(gh variable get CLAUDE_DESKTOP_VERSION)"
+```
+
+When upstream Claude Desktop updates, the `check-claude-version` workflow automatically updates `CLAUDE_DESKTOP_VERSION`, patches `build.sh` URLs, and creates a new tag — no manual intervention needed.
 
 ## Common Gotchas
 

@@ -178,6 +178,24 @@ function translateGuestPath(guestPath, mountMap) {
 }
 
 /**
+ * Resolve a subpath that may be root-relative (e.g. "home/user/.config/...")
+ * or home-relative (e.g. ".config/..."). app.asar generates root-relative
+ * subpaths via path.relative('/', absolutePath), so path.join('/', subpath)
+ * recovers the original absolute path. Falls back to home-relative for
+ * legacy or genuinely relative subpaths.
+ *
+ * Fix for https://github.com/aaddrick/claude-desktop-debian/issues/373
+ */
+function resolveSubpath(subpath) {
+    if (!subpath) return os.homedir();
+    const asRoot = path.resolve(path.join('/', subpath));
+    if (asRoot.startsWith(os.homedir() + path.sep) || asRoot === os.homedir()) {
+        return asRoot;
+    }
+    return path.resolve(path.join(os.homedir(), subpath));
+}
+
+/**
  * Build a mount-name -> host-path mapping from mountBinds (prior
  * mountPath() calls) and additionalMounts (spawn params).
  * additionalMounts entries take precedence over mountBinds.
@@ -195,9 +213,7 @@ function buildMountMap(additionalMounts, mountBinds) {
         const homeDir = os.homedir();
         for (const [name, info] of Object.entries(additionalMounts)) {
             if (!info || !info.path) continue;
-            const resolved = path.resolve(
-                path.join(homeDir, info.path)
-            );
+            const resolved = resolveSubpath(info.path);
             if (resolved !== homeDir &&
                 !resolved.startsWith(homeDir + path.sep)) {
                 log(`buildMountMap: rejecting "${name}" — resolves outside home: ${resolved}`);
@@ -212,8 +228,8 @@ function buildMountMap(additionalMounts, mountBinds) {
 
 /**
  * Build a merged environment for a spawned process. Combines filtered
- * daemon env with app-provided env, and translates CLAUDE_CONFIG_DIR
- * guest paths using mountMap.
+ * daemon env with app-provided env, and translates guest paths in
+ * CLAUDE_CONFIG_DIR and CLAUDE_COWORK_MEMORY_PATH_OVERRIDE using mountMap.
  */
 function buildSpawnEnv(appEnv, mountMap) {
     const mergedEnv = {
@@ -224,20 +240,70 @@ function buildSpawnEnv(appEnv, mountMap) {
 
     // Translate CLAUDE_CONFIG_DIR from guest path to host path, or
     // remove it so Claude Code falls back to ~/.claude/.
-    if (mergedEnv.CLAUDE_CONFIG_DIR &&
-        mergedEnv.CLAUDE_CONFIG_DIR.startsWith('/sessions/')) {
-        const translated = translateGuestPath(
-            mergedEnv.CLAUDE_CONFIG_DIR, mountMap
-        );
-        if (translated) {
-            log(`buildSpawnEnv: translated CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR} -> ${translated}`);
-            mergedEnv.CLAUDE_CONFIG_DIR = translated;
+    if (mergedEnv.CLAUDE_CONFIG_DIR) {
+        if (mergedEnv.CLAUDE_CONFIG_DIR.startsWith('/sessions/')) {
+            // translate guest path to host path
+            const translated = translateGuestPath(
+                mergedEnv.CLAUDE_CONFIG_DIR, mountMap
+            );
+            if (translated !== mergedEnv.CLAUDE_CONFIG_DIR) {
+                log(`buildSpawnEnv: translated CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR} -> ${translated}`);
+                mergedEnv.CLAUDE_CONFIG_DIR = translated;
+            }
         } else {
-            log(`buildSpawnEnv: removing VM guest CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR}`);
-            delete mergedEnv.CLAUDE_CONFIG_DIR;
+            // Host path — may be doubled by app.asar's own
+            // path.join(homedir, rootRelativeSubpath). Extract the
+            // relative part and resolve it properly.
+            const homeDir = os.homedir();
+            if (mergedEnv.CLAUDE_CONFIG_DIR.startsWith(homeDir + path.sep)) {
+                const relative = mergedEnv.CLAUDE_CONFIG_DIR.slice(homeDir.length + 1);
+                const fixed = resolveSubpath(relative);
+                if (fixed !== mergedEnv.CLAUDE_CONFIG_DIR) {
+                    log(`buildSpawnEnv: fixed doubled CLAUDE_CONFIG_DIR: ${mergedEnv.CLAUDE_CONFIG_DIR} -> ${fixed}`);
+                    mergedEnv.CLAUDE_CONFIG_DIR = fixed;
+                }
+            }
         }
     }
 
+
+    // Translate CLAUDE_COWORK_MEMORY_PATH_OVERRIDE from guest path to
+    // host path. The Electron app sets this to /sessions/{id}/mnt/.auto-memory
+    // regardless of backend, but on HostBackend the /sessions/ directory
+    // does not exist. Try translateGuestPath first (works if .auto-memory
+    // is in mountMap via additionalMounts), then fall back to resolving
+    // the mount-name portion the way HostBackend.mountPath() would —
+    // via resolveSubpath() — so the path resolves to a writable host
+    // location (typically ~/.auto-memory).
+    if (mergedEnv.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE) {
+        const memPath = mergedEnv.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE;
+        if (memPath.startsWith('/sessions/')) {
+            const translated = translateGuestPath(memPath, mountMap);
+            if (translated) {
+                log(`buildSpawnEnv: translated CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: ${memPath} -> ${translated}`);
+                mergedEnv.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE = translated;
+            } else {
+                // .auto-memory is an internal Cowork path typically not
+                // present in additionalMounts. Extract the mount-name
+                // (and any trailing subpath) and resolve via
+                // resolveSubpath, mirroring HostBackend.mountPath().
+                const match = memPath.match(
+                    /^\/sessions\/[^/]+\/mnt\/([^/]+)(\/.*)?$/
+                );
+                if (match) {
+                    const hostPath = path.join(
+                        resolveSubpath(match[1]),
+                        match[2] || ''
+                    );
+                    log(`buildSpawnEnv: resolved CLAUDE_COWORK_MEMORY_PATH_OVERRIDE via fallback: ${memPath} -> ${hostPath}`);
+                    mergedEnv.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE = hostPath;
+                } else {
+                    log(`buildSpawnEnv: could not translate CLAUDE_COWORK_MEMORY_PATH_OVERRIDE, removing: ${memPath}`);
+                    delete mergedEnv.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE;
+                }
+            }
+        }
+    }
     return mergedEnv;
 }
 
@@ -319,7 +385,7 @@ function resolvePluginRoot(pluginPath, mountBase) {
 function resolveWorkDir(cwd, sharedCwdPath, mountMap) {
     let workDir = cwd || os.homedir();
     if (sharedCwdPath) {
-        workDir = path.join(os.homedir(), sharedCwdPath);
+        workDir = resolveSubpath(sharedCwdPath);
     } else if (cwd && cwd.startsWith('/sessions/')) {
         const translated = translateGuestPath(cwd, mountMap || {});
         if (translated) {
@@ -346,7 +412,7 @@ function resolveWorkDir(cwd, sharedCwdPath, mountMap) {
 function resolveSdkBinary(sdkSubpath, version, label) {
     if (!sdkSubpath || !version) return null;
     const candidatePath = path.join(
-        os.homedir(), sdkSubpath, version, 'claude'
+        resolveSubpath(sdkSubpath), version, 'claude'
     );
     try {
         fs.accessSync(candidatePath, fs.constants.X_OK);
@@ -382,6 +448,183 @@ function resolveCommand(command, sdkBinaryPath) {
     } catch (e) {
         return { command: null, error: `${command} not found` };
     }
+}
+
+// ============================================================
+// Bwrap Mount Configuration
+// ============================================================
+
+const FORBIDDEN_MOUNT_PATHS = new Set(['/', '/proc', '/dev', '/sys']);
+
+function validateMountPath(mountPath, opts) {
+    opts = opts || {};
+    if (!mountPath || !path.isAbsolute(mountPath)) {
+        return { valid: false, reason: 'Path must be absolute' };
+    }
+
+    const normalized = path.resolve(mountPath);
+
+    // Resolve symlinks when the path exists on disk (defense-in-depth).
+    // This is a TOCTOU situation, but bwrap is the real security boundary;
+    // this just catches honest configuration mistakes.
+    let resolved = normalized;
+    try {
+        resolved = fs.realpathSync(normalized);
+    } catch (_) {
+        // Path doesn't exist yet — use the unresolved form
+    }
+
+    function checkForbidden(p) {
+        if (FORBIDDEN_MOUNT_PATHS.has(p)) {
+            return `Path is forbidden: ${p}`;
+        }
+        for (const forbidden of FORBIDDEN_MOUNT_PATHS) {
+            if (forbidden !== '/' && p.startsWith(forbidden + '/')) {
+                return `Path is under forbidden path: ${forbidden}`;
+            }
+        }
+        return null;
+    }
+
+    const normalizedErr = checkForbidden(normalized);
+    if (normalizedErr) {
+        return { valid: false, reason: normalizedErr };
+    }
+
+    if (resolved !== normalized) {
+        const resolvedErr = checkForbidden(resolved);
+        if (resolvedErr) {
+            return { valid: false, reason: `Symlink resolves to forbidden path: ${resolved}` };
+        }
+    }
+
+    if (opts.readWrite) {
+        const home = os.homedir();
+        const check = resolved !== normalized ? resolved : normalized;
+        if (check !== home && !check.startsWith(home + '/')) {
+            return { valid: false, reason: 'Read-write mounts must be under $HOME' };
+        }
+    }
+
+    return { valid: true };
+}
+
+function loadBwrapMountsConfig(configPath, logFn) {
+    const warn = logFn || log;
+    const empty = {
+        additionalROBinds: [],
+        additionalBinds: [],
+        disabledDefaultBinds: [],
+    };
+
+    if (!configPath) {
+        configPath = path.join(
+            process.env.HOME || os.homedir(),
+            '.config', 'Claude', 'claude_desktop_linux_config.json'
+        );
+    }
+
+    let raw;
+    try {
+        raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch (_) {
+        return empty;
+    }
+
+    const mounts = raw && raw.preferences && raw.preferences.coworkBwrapMounts;
+    if (!mounts || typeof mounts !== 'object') {
+        return empty;
+    }
+
+    function filterPaths(arr, readWrite) {
+        if (!Array.isArray(arr)) return [];
+        return arr.filter(p => {
+            if (typeof p !== 'string') return false;
+            const result = validateMountPath(p, { readWrite });
+            if (!result.valid) {
+                warn(`BwrapConfig: rejected path "${p}": ${result.reason}`);
+            }
+            return result.valid;
+        });
+    }
+
+    return {
+        additionalROBinds: filterPaths(mounts.additionalROBinds, false),
+        additionalBinds: filterPaths(mounts.additionalBinds, true),
+        disabledDefaultBinds: Array.isArray(mounts.disabledDefaultBinds)
+            ? mounts.disabledDefaultBinds
+                .filter(p => {
+                    if (typeof p !== 'string') return false;
+                    if (!path.isAbsolute(p)) {
+                        warn(`BwrapConfig: rejected disabled path "${p}": Path must be absolute`);
+                        return false;
+                    }
+                    const normalized = path.resolve(p);
+                    if (CRITICAL_MOUNTS.has(normalized)) {
+                        warn(`BwrapConfig: cannot disable critical mount: ${normalized}`);
+                        return false;
+                    }
+                    return true;
+                })
+                .map(p => path.resolve(p))
+            : [],
+    };
+}
+
+const CRITICAL_MOUNTS = new Set(['/', '/dev', '/proc']);
+
+function mergeBwrapArgs(defaultArgs, config) {
+    const result = [];
+    const disabled = new Set(
+        config.disabledDefaultBinds.filter(p => !CRITICAL_MOUNTS.has(p))
+    );
+
+    const TWO_ARG_FLAGS = new Set([
+        '--tmpfs', '--dev', '--proc', '--dir',
+        '--remount-ro', '--file', '--unsetenv',
+        '--chdir', '--size', '--perms',
+    ]);
+    const THREE_ARG_FLAGS = new Set([
+        '--ro-bind', '--bind', '--symlink',
+        '--ro-bind-try', '--bind-try',
+        '--dev-bind', '--dev-bind-try',
+        '--chmod', '--setenv',
+    ]);
+
+    let i = 0;
+    while (i < defaultArgs.length) {
+        const flag = defaultArgs[i];
+
+        if (THREE_ARG_FLAGS.has(flag) && i + 2 < defaultArgs.length) {
+            const dest = defaultArgs[i + 2];
+            if (disabled.has(dest)) {
+                i += 3;
+                continue;
+            }
+            result.push(defaultArgs[i], defaultArgs[i + 1], defaultArgs[i + 2]);
+            i += 3;
+        } else if (TWO_ARG_FLAGS.has(flag) && i + 1 < defaultArgs.length) {
+            const dest = defaultArgs[i + 1];
+            if (disabled.has(dest)) {
+                i += 2;
+                continue;
+            }
+            result.push(defaultArgs[i], defaultArgs[i + 1]);
+            i += 2;
+        } else {
+            result.push(defaultArgs[i]);
+            i++;
+        }
+    }
+
+    for (const p of config.additionalROBinds) {
+        result.push('--ro-bind', p, p);
+    }
+    for (const p of config.additionalBinds) {
+        result.push('--bind', p, p);
+    }
+
+    return result;
 }
 
 // ============================================================
@@ -731,7 +974,7 @@ class HostBackend extends LocalBackend {
     async mountPath(params) {
         const { subpath } = params;
         log(`HostBackend mountPath: ${subpath}`);
-        const guestPath = path.join(os.homedir(), subpath || '');
+        const guestPath = resolveSubpath(subpath);
         return { guestPath };
     }
 }
@@ -744,6 +987,16 @@ class BwrapBackend extends LocalBackend {
     constructor(emitEvent) {
         super(emitEvent, 'BwrapBackend');
         this.mountBinds = new Map(); // mountName -> hostPath
+        this.bwrapMountsConfig = loadBwrapMountsConfig(null, log);
+        const mc = this.bwrapMountsConfig;
+        if (mc.additionalROBinds.length
+            || mc.additionalBinds.length
+            || mc.disabledDefaultBinds.length) {
+            log('BwrapBackend: custom mount config: '
+                + mc.additionalROBinds.length + ' RO, '
+                + mc.additionalBinds.length + ' RW, '
+                + mc.disabledDefaultBinds.length + ' disabled');
+        }
     }
 
     async startVM(params) {
@@ -792,7 +1045,7 @@ class BwrapBackend extends LocalBackend {
         // necessary system paths bound in read-only. This avoids
         // exposing the real home directory and allows creating the
         // /sessions/ guest path structure that claude-code-vm expects.
-        const bwrapArgs = [
+        const defaultBwrapArgs = [
             '--tmpfs', '/',
             '--ro-bind', '/usr', '/usr',
             '--ro-bind', '/etc', '/etc',
@@ -808,10 +1061,10 @@ class BwrapBackend extends LocalBackend {
         for (const dir of ['/bin', '/lib', '/lib64', '/sbin']) {
             try {
                 const target = fs.readlinkSync(dir);
-                bwrapArgs.push('--symlink', target, dir);
+                defaultBwrapArgs.push('--symlink', target, dir);
             } catch (_) {
                 if (fs.existsSync(dir)) {
-                    bwrapArgs.push('--ro-bind', dir, dir);
+                    defaultBwrapArgs.push('--ro-bind', dir, dir);
                 }
             }
         }
@@ -823,11 +1076,14 @@ class BwrapBackend extends LocalBackend {
             const resolvedConf = fs.realpathSync('/etc/resolv.conf');
             if (resolvedConf.startsWith('/run/')) {
                 const resolvedDir = path.dirname(resolvedConf);
-                bwrapArgs.push('--ro-bind', resolvedDir, resolvedDir);
+                defaultBwrapArgs.push('--ro-bind', resolvedDir, resolvedDir);
             }
         } catch (e) {
             log('BwrapBackend: could not resolve /etc/resolv.conf:', e.message);
         }
+
+        // Merge user-configured mounts (disable overrides + additional mounts)
+        const bwrapArgs = mergeBwrapArgs(defaultBwrapArgs, this.bwrapMountsConfig);
 
         // Bind the SDK binary read-only
         const sdkDir = path.dirname(actualCommand);
@@ -848,6 +1104,22 @@ class BwrapBackend extends LocalBackend {
 
         for (const [mountName, hostPath] of Object.entries(mountMap)) {
             try {
+                // Fix #342: upstream fs-extra can create .mcpb-cache
+                // as a self-referential symlink after repeated sessions.
+                // Detect and remove before mkdir so the bind mount works.
+                try {
+                    const st = fs.lstatSync(hostPath);
+                    if (st.isSymbolicLink()) {
+                        const target = fs.readlinkSync(hostPath);
+                        const resolved = path.resolve(
+                            path.dirname(hostPath), target
+                        );
+                        if (resolved === hostPath) {
+                            log(`BwrapBackend spawn: removing self-referential symlink: ${hostPath}`);
+                            fs.unlinkSync(hostPath);
+                        }
+                    }
+                } catch { /* ENOENT is fine — path doesn't exist yet */ }
                 if (!fs.existsSync(hostPath)) {
                     fs.mkdirSync(hostPath, { recursive: true });
                 }
@@ -894,7 +1166,7 @@ class BwrapBackend extends LocalBackend {
     async mountPath(params) {
         const { subpath, mountName } = params;
         log(`BwrapBackend mountPath: ${mountName} -> ${subpath}`);
-        const hostPath = path.join(os.homedir(), subpath || '');
+        const hostPath = resolveSubpath(subpath);
         // Store for --bind on next spawn
         this.mountBinds.set(mountName || subpath, hostPath);
         return { guestPath: hostPath };
@@ -1704,7 +1976,7 @@ class KvmBackend extends BackendBase {
         }
 
         // No home share — return host path with a warning
-        const hostPath = path.join(os.homedir(), subpath || '');
+        const hostPath = resolveSubpath(subpath);
         log('KvmBackend: no home share, returning host path');
         return { guestPath: hostPath };
     }
@@ -2122,5 +2394,15 @@ function startServer() {
 // dedup flag (_svcLaunched) preventing duplicate daemon launches, so a
 // simple synchronous cleanup avoids the race condition where an async
 // connection test delays startup while the app is already retrying.
-cleanupSocket();
-startServer();
+if (require.main === module) {
+    cleanupSocket();
+    startServer();
+}
+
+module.exports = {
+    FORBIDDEN_MOUNT_PATHS,
+    CRITICAL_MOUNTS,
+    validateMountPath,
+    loadBwrapMountsConfig,
+    mergeBwrapArgs,
+};

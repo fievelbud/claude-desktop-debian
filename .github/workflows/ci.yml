@@ -20,6 +20,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   test-flags:
     name: Test Flags Parsing
@@ -49,6 +53,11 @@ jobs:
       artifact_suffix: ${{ matrix.artifact_suffix }}
       release_tag: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
 
+  test-artifacts:
+    name: Test Build Artifacts
+    needs: [build-amd64]
+    uses: ./.github/workflows/test-artifacts.yml
+
   build-arm64:
     name: Build Packages (arm64 - ${{ matrix.artifact_suffix }})
     needs: test-flags
@@ -76,7 +85,7 @@ jobs:
   release:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test-flags, build-amd64, build-arm64]
+    needs: [test-flags, build-amd64, build-arm64, test-artifacts]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -207,7 +216,9 @@ jobs:
           fi
 
       - name: Run compare-releases (upstream change)
-        if: steps.prev.outcome == 'success' && steps.prev.outputs.type == 'upstream'
+        if: false # disabled — release notes are managed manually
+        # was: steps.prev.outcome == 'success' && steps.prev.outputs.type == 'upstream'
+        timeout-minutes: 180
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -300,7 +311,7 @@ jobs:
           } > ../compare-work/summary.md
 
       - name: Generate fallback release notes
-        if: ${{ !cancelled() }}
+        if: ${{ always() }}
         run: |
           # Only generate fallback if AI-generated notes don't exist
           if [[ -f compare-work/summary.md ]]; then
@@ -358,6 +369,7 @@ jobs:
           } > compare-work/summary.md
 
       - name: Create GitHub Release
+        if: ${{ always() }}
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*

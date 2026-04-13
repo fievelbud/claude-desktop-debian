@@ -103,15 +103,15 @@ detect_architecture() {
 
 	case "$raw_arch" in
 		x86_64)
-			claude_download_url='https://downloads.claude.ai/releases/win32/x64/1.1.8359/Claude-64248d95686d5145111a312b9128269844f73d01.exe'
-			claude_exe_sha256='0dccf569c8ce2a78cceb4f712ca382a33cf8250c2559e3f4b18c2c31efaa0ccf'
+			claude_download_url='https://downloads.claude.ai/releases/win32/x64/1.1617.0/Claude-8d63450d9eae59f17102abdee7bf0759472f30a2.exe'
+			claude_exe_sha256='40cc470930b871915ff044b0d2374d46ac724cdee9c8c22fe432a06585478c0b'
 			architecture='amd64'
 			claude_exe_filename='Claude-Setup-x64.exe'
 			echo 'Configured for amd64 (x86_64) build.'
 			;;
 		aarch64)
-			claude_download_url='https://downloads.claude.ai/releases/win32/arm64/1.1.8359/Claude-64248d95686d5145111a312b9128269844f73d01.exe'
-			claude_exe_sha256='e0046e52ce7a54cf3618591ea15d18ab121781a1342f367008060cdac8a8b79d'
+			claude_download_url='https://downloads.claude.ai/releases/win32/arm64/1.1617.0/Claude-8d63450d9eae59f17102abdee7bf0759472f30a2.exe'
+			claude_exe_sha256='598a8679bce34a4f2377e367c5678dbdc3ee708598df784fdbc5632a31671253'
 			architecture='arm64'
 			claude_exe_filename='Claude-Setup-arm64.exe'
 			echo 'Configured for arm64 (aarch64) build.'
@@ -920,10 +920,123 @@ patch_menu_bar_default() {
 }
 
 patch_quick_window() {
-	if ! grep -q 'e.blur(),e.hide()' app.asar.contents/.vite/build/index.js; then
-		sed -i 's/e.hide()/e.blur(),e.hide()/' app.asar.contents/.vite/build/index.js
-		echo 'Added blur() call to fix quick window submit issue'
+	echo 'Patching quick window for Linux...'
+	local index_js='app.asar.contents/.vite/build/index.js'
+
+	# Extract the quick window variable name from the unique "pop-up-menu"
+	# setAlwaysOnTop call, e.g.: Sa.setAlwaysOnTop(!0,"pop-up-menu")
+	local quick_var
+	quick_var=$(grep -oP '\w+(?=\.setAlwaysOnTop\(\s*!0\s*,\s*"pop-up-menu"\))' \
+		"$index_js" | head -1)
+	if [[ -z $quick_var ]]; then
+		echo 'WARNING: Could not extract quick window variable name'
+		echo '##############################################################'
+		return
 	fi
+	echo "  Found quick window variable: $quick_var"
+
+	local quick_var_re="${quick_var//\$/\\$}"
+
+	# Part 1: Add blur() before hide() on the quick window so that
+	# isFocused() returns false after hiding (Electron Linux bug).
+	# The hide call sits after || (e.g. GUARD()||VAR.hide()), so both
+	# calls must be wrapped in parens to preserve short-circuit semantics.
+	if grep -qP "${quick_var_re}\.blur\(\),${quick_var_re}\.hide\(\)" \
+		"$index_js"; then
+		echo '  Quick window blur already patched'
+	elif grep -qP "\|\|${quick_var_re}\.hide\(\)" "$index_js"; then
+		sed -i \
+			"s/||${quick_var_re}\.hide()/||(${quick_var_re}.blur(),${quick_var_re}.hide())/g" \
+			"$index_js"
+		echo '  Added blur() before hide() on quick window'
+	else
+		echo '  WARNING: Could not find quick window hide() call'
+	fi
+
+	# Part 2: Fix main window not appearing after quick entry submit.
+	# On Linux, isFocused() can return stale true after hiding, causing
+	# FOCUS_CHECK()||Lt.show() to skip the show. Replace the focus check
+	# with the visibility check in quick entry code paths.
+	if INDEX_JS="$index_js" node << 'QUICK_WINDOW_PATCH'
+const fs = require('fs');
+const indexJs = process.env.INDEX_JS;
+let code = fs.readFileSync(indexJs, 'utf8');
+let patchCount = 0;
+
+// Find the minified isWindowFocused function via its named property
+// export: isWindowFocused: () => !!NAME()
+const focusedPropRe = /isWindowFocused:\s*\(\)\s*=>\s*!!(\w+)\(\)/;
+const focusedMatch = code.match(focusedPropRe);
+if (!focusedMatch) {
+    console.log('  WARNING: Could not find isWindowFocused function');
+    process.exit(0);
+}
+const focusFn = focusedMatch[1];
+console.log('  Found focus check function: ' + focusFn);
+
+// Find the sibling isVisible function defined near the focus function
+const focusFnIdx = code.indexOf('function ' + focusFn + '(');
+const nearbyCode = code.substring(focusFnIdx, focusFnIdx + 500);
+const visFnRe = /function (\w+)\(\)\{return!\w+\|\|\w+\.isDestroyed\(\)\?!1:\w+\.isVisible\(\)/;
+const visMatch = nearbyCode.match(visFnRe);
+if (!visMatch) {
+    console.log('  WARNING: Could not find visibility function near ' +
+        focusFn);
+    process.exit(0);
+}
+const visFn = visMatch[1];
+console.log('  Found visibility check function: ' + visFn);
+
+// Anchor on unique QuickEntry log strings to patch only the right sites
+const anchors = [
+    'Navigating to existing chat',
+    'Creating new chat with submit_quick_entry',
+];
+for (const anchor of anchors) {
+    const anchorIdx = code.indexOf(anchor);
+    if (anchorIdx === -1) {
+        console.log('  WARNING: anchor not found: ' + anchor);
+        continue;
+    }
+    // Search region after anchor (1500 chars covers promise chains)
+    const region = code.substring(anchorIdx, anchorIdx + 1500);
+    const showRe = new RegExp(
+        focusFn.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+        '\\(\\)\\|\\|(\\w+)\\.show\\(\\)'
+    );
+    const showMatch = region.match(showRe);
+    if (showMatch) {
+        const oldStr = showMatch[0];
+        const mainWin = showMatch[1];
+        const newStr = visFn + '()||' + mainWin + '.show()';
+        if (oldStr !== newStr) {
+            const absIdx = anchorIdx + region.indexOf(oldStr);
+            code = code.substring(0, absIdx) + newStr +
+                code.substring(absIdx + oldStr.length);
+            console.log('  Replaced ' + focusFn + '() with ' + visFn +
+                '() for show() near "' + anchor.substring(0, 30) + '..."');
+            patchCount++;
+        }
+    } else {
+        console.log('  WARNING: show() pattern not found near "' +
+            anchor + '"');
+    }
+}
+
+if (patchCount > 0) {
+    fs.writeFileSync(indexJs, code);
+    console.log('  Patched ' + patchCount +
+        ' quick entry show() calls to use visibility check');
+} else {
+    console.log('  WARNING: No quick entry show() calls patched');
+}
+QUICK_WINDOW_PATCH
+	then
+		echo 'Quick window patches applied'
+	else
+		echo 'WARNING: Quick window show patch failed' >&2
+	fi
+	echo '##############################################################'
 }
 
 patch_linux_claude_code() {
@@ -1216,7 +1329,8 @@ if (serviceErrorIdx !== -1) {
             'if(require("fs").existsSync(_d)){' +
             'const _c=require("child_process").fork(_d,[],' +
             '{detached:true,stdio:"ignore",env:{...process.env,' +
-            'ELECTRON_RUN_AS_NODE:"1"}});_c.unref()}' +
+            'ELECTRON_RUN_AS_NODE:"1"}});' +
+            'global.__coworkDaemonPid=_c.pid;_c.unref()}' +
             '}catch(_e){console.error("[cowork-autolaunch]",_e)}})()),';
         code = code.substring(0, retryAbsIdx) +
             autoLaunch + code.substring(retryAbsIdx);
@@ -1288,6 +1402,8 @@ if (serviceErrorIdx !== -1) {
 // (Windows HCS setup) which causes "Request timed out" on
 // Linux (#315). Inject a separate Linux block after the win32
 // block that only does the smol-bin copy.
+// Variable names are extracted dynamically from the win32 block
+// since minified names change between releases (#344).
 // ============================================================
 {
     const anchor = '"[VM:start] Windows VM service configured"';
@@ -1296,29 +1412,135 @@ if (serviceErrorIdx !== -1) {
         // Find the "}" closing the win32 if-block after the anchor
         const closingBrace = code.indexOf('}', anchorIdx + anchor.length);
         if (closingBrace !== -1) {
-            // Scope variables: uX()=arch, Qe=path, i=bundlePath,
-            //   ft=fs, vg=stream/pipeline, tt=logger
-            const linuxBlock =
-                'if(process.platform==="linux"){' +
-                'const _la=uX(),' +
-                '_ls=Qe.join(process.resourcesPath,`smol-bin.${_la}.vhdx`),' +
-                '_ld=Qe.join(i,"smol-bin.vhdx");' +
-                'ft.existsSync(_ls)?' +
-                '(tt.info(`[VM:start] Copying smol-bin.${_la}.vhdx to bundle (Linux)`),' +
-                'await vg.pipeline(ft.createReadStream(_ls),ft.createWriteStream(_ld)),' +
-                'tt.info(`[VM:start] smol-bin.${_la}.vhdx copied successfully`))' +
-                ':tt.warn(`[VM:start] smol-bin.${_la}.vhdx not found at ${_ls}`)' +
-                '}';
-            code = code.substring(0, closingBrace + 1) +
-                linuxBlock +
-                code.substring(closingBrace + 1);
-            console.log('  Injected Linux smol-bin copy block (skips _.configure)');
-            patchCount++;
+            // Extract minified variable names from the win32 block
+            // Search backwards from anchor to find the win32 block
+            const regionStart = Math.max(0, anchorIdx - 1000);
+            const region = code.substring(regionStart, anchorIdx);
+
+            // path var: VAR.join(process.resourcesPath,
+            const pathMatch = region.match(
+                /(\w+)\.join\(\s*process\.resourcesPath\s*,/
+            );
+            // fs var: VAR.existsSync(
+            const fsMatch = region.match(/(\w+)\.existsSync\(/);
+            // logger var: VAR.info("[VM:start]
+            const logMatch = region.match(
+                /(\w+)\.info\(\s*[`"]\[VM:start\]/
+            );
+            // stream/pipeline var: VAR.pipeline(
+            const streamMatch = region.match(/(\w+)\.pipeline\(/);
+            // arch function: const VAR=FUNC(), used in smol-bin
+            const archMatch = region.match(
+                /const\s+(\w+)\s*=\s*(\w+)\(\)\s*,\s*\w+\s*=\s*\w+\.join/
+            );
+            // bundlePath var: PATH.join(VAR,"smol-bin.vhdx")
+            const bundleMatch = region.match(
+                /\.join\(\s*(\w+)\s*,\s*"smol-bin\.vhdx"\s*\)/
+            );
+
+            if (pathMatch && fsMatch && logMatch &&
+                streamMatch && archMatch && bundleMatch) {
+                const pathVar = pathMatch[1];
+                const fsVar = fsMatch[1];
+                const logVar = logMatch[1];
+                const streamVar = streamMatch[1];
+                const archFunc = archMatch[2];
+                const bundleVar = bundleMatch[1];
+
+                const linuxBlock =
+                    'if(process.platform==="linux"){' +
+                    'const _la=' + archFunc + '(),' +
+                    '_ls=' + pathVar + '.join(process.resourcesPath,' +
+                        '`smol-bin.${_la}.vhdx`),' +
+                    '_ld=' + pathVar + '.join(' + bundleVar +
+                        ',"smol-bin.vhdx");' +
+                    fsVar + '.existsSync(_ls)?' +
+                    '(' + logVar + '.info(' +
+                        '`[VM:start] Copying smol-bin.${_la}' +
+                        '.vhdx to bundle (Linux)`),' +
+                    'await ' + streamVar + '.pipeline(' +
+                        fsVar + '.createReadStream(_ls),' +
+                        fsVar + '.createWriteStream(_ld)),' +
+                    logVar + '.info(' +
+                        '`[VM:start] smol-bin.${_la}' +
+                        '.vhdx copied successfully`))' +
+                    ':' + logVar + '.warn(' +
+                        '`[VM:start] smol-bin.${_la}' +
+                        '.vhdx not found at ${_ls}`)' +
+                    '}';
+                code = code.substring(0, closingBrace + 1) +
+                    linuxBlock +
+                    code.substring(closingBrace + 1);
+                console.log('  Injected Linux smol-bin copy block (skips _.configure)');
+                console.log(`    vars: path=${pathVar} fs=${fsVar} log=${logVar} stream=${streamVar} arch=${archFunc} bundle=${bundleVar}`);
+                patchCount++;
+            } else {
+                const missing = [];
+                if (!pathMatch) missing.push('path');
+                if (!fsMatch) missing.push('fs');
+                if (!logMatch) missing.push('logger');
+                if (!streamMatch) missing.push('stream');
+                if (!archMatch) missing.push('arch');
+                if (!bundleMatch) missing.push('bundlePath');
+                console.log(`  WARNING: Could not extract minified variable(s): ${missing.join(', ')}`);
+            }
         } else {
             console.log('  WARNING: Could not find closing brace after Windows VM service anchor');
         }
     } else {
         console.log('  WARNING: Could not find Windows VM service anchor for smol-bin patch');
+    }
+}
+
+// ============================================================
+// Patch 10: Register quit handler for cowork daemon cleanup
+// The upstream vm-shutdown handler uses a Swift addon unavailable
+// on Linux. Register our own to SIGTERM the daemon on app quit.
+// ============================================================
+{
+    const quitFnRe = /registerQuitHandler:\s*(\w+)/;
+    const quitFnMatch = code.match(quitFnRe);
+    if (quitFnMatch) {
+        const quitFn = quitFnMatch[1];
+        console.log('  Found registerQuitHandler function: ' + quitFn);
+
+        const quitFnDef = 'function ' + quitFn + '(';
+        const quitFnDefIdx = code.indexOf(quitFnDef);
+        if (quitFnDefIdx !== -1) {
+            const fnBlock = extractBlock(code, quitFnDefIdx, '{');
+            if (fnBlock) {
+                const insertIdx = code.indexOf(fnBlock, quitFnDefIdx) +
+                    fnBlock.length;
+                const shutdownHandler =
+                    'process.platform==="linux"&&' + quitFn + '({' +
+                    'name:"cowork-linux-daemon-shutdown",' +
+                    'fn:async()=>{' +
+                    'const _p=global.__coworkDaemonPid;' +
+                    'if(!_p)return;' +
+                    'try{const _cmd=require("fs").readFileSync(' +
+                    '"/proc/"+_p+"/cmdline","utf8");' +
+                    'if(!_cmd.includes("cowork-vm-service"))return' +
+                    '}catch(_e){return}' +
+                    'try{process.kill(_p,"SIGTERM")}catch(_e){return}' +
+                    'for(let _i=0;_i<50;_i++){' +
+                    'await new Promise(_r=>setTimeout(_r,200));' +
+                    'try{process.kill(_p,0)}catch(_e){return}' +
+                    '}}});';
+                code = code.substring(0, insertIdx) +
+                    shutdownHandler + code.substring(insertIdx);
+                console.log('  Registered Linux cowork daemon quit handler');
+                patchCount++;
+            } else {
+                console.log('  WARNING: Could not find ' + quitFn +
+                    ' function body for quit handler');
+            }
+        } else {
+            console.log('  WARNING: Could not find ' + quitFn +
+                ' function definition');
+        }
+    } else {
+        console.log('  WARNING: Could not find registerQuitHandler' +
+            ' export for quit handler');
     }
 }
 
