@@ -9,6 +9,12 @@ This project repackages Claude Desktop (Electron app) for Debian/Ubuntu Linux, a
 The [`docs/learnings/`](docs/learnings/) directory contains hard-won technical knowledge from debugging and fixing issues — things that aren't obvious from reading the code or docs alone. Consult these before working on related areas. Add new entries when you discover something non-obvious that would save future contributors (human or AI) significant time.
 
 - [`nix.md`](docs/learnings/nix.md) — NixOS packaging, Electron resource path resolution, testing without NixOS
+- [`cowork-vm-daemon.md`](docs/learnings/cowork-vm-daemon.md) — Cowork VM daemon lifecycle, respawn logic, crash diagnosis
+- [`plugin-install.md`](docs/learnings/plugin-install.md) — Anthropic & Partners plugin install flow, gate logic, backend endpoints, and DevTools recipes
+- [`apt-worker-architecture.md`](docs/learnings/apt-worker-architecture.md) — APT/DNF binary distribution via Cloudflare Worker + GitHub Releases, redirect chain, credential ownership, heartbeat runbook
+- [`tray-rebuild-race.md`](docs/learnings/tray-rebuild-race.md) — why destroy + recreate on `nativeTheme` updates briefly duplicates the tray icon on KDE Plasma, and the in-place `setImage` + `setContextMenu` fast-path that avoids the SNI re-registration race
+- [`mcp-double-spawn.md`](docs/learnings/mcp-double-spawn.md) — Stdio MCPs spawn 2× when chat and Code/Agent panels are both active, root cause in upstream session managers, MCP-author workaround
+- [`linux-topbar-shim.md`](docs/learnings/linux-topbar-shim.md) — why claude.ai's in-app topbar is missing on Linux, the four gates that hide it, why the upstream `frame:false` + WCO config has unclickable buttons on X11 (Chromium-level implicit drag region), and the resolution: hybrid mode (system frame + UA-spoof shim → stacked layout, full button functionality)
 
 ## Code Style
 
@@ -106,7 +112,7 @@ Contributors are listed in chronological order: inspirational projects first (k3
 
 ### Important Guidelines
 
-1. **Always use regex patterns** when modifying the source JavaScript in `build.sh`. Variable and function names are minified and **change between releases**.
+1. **Always use regex patterns** when modifying the source JavaScript. Patches live in `scripts/patches/*.sh` (one file per subsystem: `tray.sh`, `cowork.sh`, `claude-code.sh`, etc.); `build.sh` is only an orchestrator that sources them. Variable and function names are minified and **change between releases**.
 
 2. **The beautified code in `build-reference/` has different spacing** than the actual minified code in the app. Patterns must handle both:
    - Minified: `oe.nativeTheme.on("updated",()=>{`
@@ -114,7 +120,7 @@ Contributors are listed in chronological order: inspirational projects first (k3
 
 3. **Use `-E` flag with sed** for extended regex support when patterns need grouping or alternation.
 
-4. **Extract variable names dynamically** rather than hardcoding them. Example from `build.sh`:
+4. **Extract variable names dynamically** rather than hardcoding them. Shared extraction helpers live in `scripts/patches/_common.sh`. Example:
    ```bash
    # Extract function name from a known pattern
    TRAY_FUNC=$(grep -oP 'on\("menuBarEnabled",\(\)=>\{\K\w+(?=\(\)\})' app.asar.contents/.vite/build/index.js)
@@ -141,7 +147,7 @@ The app uses a wrapper system to intercept and fix Electron behavior for Linux:
 - **`frame-fix-wrapper.js`** - Intercepts `require('electron')` to patch BrowserWindow defaults (e.g., `frame: true` for proper window decorations on Linux)
 - **`frame-fix-entry.js`** - Entry point that loads the wrapper before the main app
 
-These are injected by `build.sh` and referenced in `package.json`'s `main` field. The wrapper pattern allows fixing Electron behavior without modifying the minified app code directly.
+These are injected by `scripts/patches/app-asar.sh` (inside `patch_app_asar`) and referenced in `package.json`'s `main` field. The wrapper pattern allows fixing Electron behavior without modifying the minified app code directly.
 
 ## Setting Up build-reference
 
@@ -311,6 +317,21 @@ gh run download RUN_ID -n artifact-name
 - `claude-desktop-VERSION-arm64.AppImage` - AppImage for ARM64
 - `result/` - Nix build output (symlink, gitignored)
 
+## Distribution
+
+APT and DNF binaries are fronted by a Cloudflare Worker at `pkg.claude-desktop-debian.dev`. Metadata (`InRelease`, `Packages`, `KEY.gpg`, `repodata/*`) passes through to the `gh-pages` branch; binary requests (`/pool/.../*.deb`, `/rpm/*/*.rpm`) get 302'd to the corresponding GitHub Release asset. This keeps `.deb` / `.rpm` files out of `gh-pages` entirely, so they never hit GitHub's 100 MB per-file push cap.
+
+Key files:
+- `worker/src/worker.js` — Worker source
+- `worker/wrangler.toml` — Worker config (route, `custom_domain = true`)
+- `.github/workflows/deploy-worker.yml` — deploys on push to `main` when `worker/**` changes
+- `.github/workflows/apt-repo-heartbeat.yml` — daily chain validation, auto-opens tracking issue on failure
+- `update-apt-repo` and `update-dnf-repo` jobs in `.github/workflows/ci.yml` — gate a strip step on Worker liveness, so binaries are removed from the local pool tree before push
+
+Repo secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`. Token scoped to the "Edit Cloudflare Workers" template.
+
+Full details including the redirect chain, the http-scheme-downgrade gotcha, credential ownership, and heartbeat failure runbook: [`docs/learnings/apt-worker-architecture.md`](docs/learnings/apt-worker-architecture.md).
+
 ## Testing
 
 ### Local Build
@@ -399,7 +420,7 @@ git tag "v1.3.24+claude$(gh variable get CLAUDE_DESKTOP_VERSION)"
 git push origin "v1.3.24+claude$(gh variable get CLAUDE_DESKTOP_VERSION)"
 ```
 
-When upstream Claude Desktop updates, the `check-claude-version` workflow automatically updates `CLAUDE_DESKTOP_VERSION`, patches `build.sh` URLs, and creates a new tag — no manual intervention needed.
+When upstream Claude Desktop updates, the `check-claude-version` workflow automatically updates `CLAUDE_DESKTOP_VERSION`, patches the URLs in `scripts/setup/detect-host.sh`, and creates a new tag — no manual intervention needed.
 
 ## Common Gotchas
 
@@ -411,17 +432,17 @@ When upstream Claude Desktop updates, the `check-claude-version` workflow automa
   ```
 - **SingletonLock** - If app won't start, check for stale lock: `~/.config/Claude/SingletonLock`
 - **Node version** - Build requires Node.js; the script downloads its own if needed
-- **Nix hashes** - When Claude Desktop version changes, both `build.sh` URLs and `nix/claude-desktop.nix` (version, URLs, SRI hashes) must be updated. The CI handles this automatically.
-- **Claude Desktop version** - A GitHub Action automatically updates the `CLAUDE_DESKTOP_VERSION` repo variable and the URLs in `build.sh` on main when a new version is detected. Before committing `build.sh`, ensure your branch has the latest URLs:
+- **Nix hashes** - When Claude Desktop version changes, both the URLs in `scripts/setup/detect-host.sh` and `nix/claude-desktop.nix` (version, URLs, SRI hashes) must be updated. The CI handles this automatically.
+- **Claude Desktop version** - A GitHub Action automatically updates the `CLAUDE_DESKTOP_VERSION` repo variable and the URLs in `scripts/setup/detect-host.sh` on main when a new version is detected. Before committing `scripts/setup/detect-host.sh`, ensure your branch has the latest URLs:
   ```bash
   # Check repo variable (source of truth)
   gh variable get CLAUDE_DESKTOP_VERSION
 
-  # Check current version in build.sh
-  grep -oP 'x64/\K[0-9]+\.[0-9]+\.[0-9]+' build.sh | head -1
+  # Check current version in the detect_architecture case statement
+  grep -oP 'x64/\K[0-9]+\.[0-9]+\.[0-9]+' scripts/setup/detect-host.sh | head -1
 
   # If outdated, pull URLs from main branch
-  gh api repos/aaddrick/claude-desktop-debian/contents/build.sh?ref=main \
-    --jq '.content' | base64 -d | grep -E "CLAUDE_DOWNLOAD_URL=|claude_download_url="
+  gh api repos/aaddrick/claude-desktop-debian/contents/scripts/setup/detect-host.sh?ref=main \
+    --jq '.content' | base64 -d | grep -E "claude_download_url="
   ```
   Update both amd64 and arm64 URLs in `detect_architecture()` to match main

@@ -1,10 +1,17 @@
-name: Issue Triage
+name: Issue Triage (v1 — manual fallback only)
 run-name: |
-  Triage: #${{ github.event.issue.number || inputs.issue_number }}
+  Triage v1: #${{ inputs.issue_number }}
+
+# v1 pipeline kept as a workflow_dispatch-only fallback. Automatic
+# triggering on `issues` was removed when v2 (issue-triage-v2.yml)
+# took over production routing. If v2 is ever paused or rolled back,
+# re-enable the `issues: [opened, reopened]` trigger here.
+#
+# Kept (not deleted) because v1 uses different code paths for
+# investigation and label application, which still occasionally help
+# for backfilled issues the maintainer wants a second opinion on.
 
 on:
-  issues:
-    types: [opened, reopened]
   workflow_dispatch:
     inputs:
       issue_number:
@@ -18,7 +25,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: issue-triage-${{ github.event.issue.number || inputs.issue_number }}
+  group: issue-triage-${{ inputs.issue_number }}
   cancel-in-progress: true
 
 jobs:
@@ -96,10 +103,10 @@ jobs:
       confidence: ${{ steps.classify.outputs.confidence }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -192,7 +199,7 @@ jobs:
           echo "Classification: $classification (skip=$skip_comment, investigate=$needs_investigation, confidence=$confidence)"
 
       - name: Upload triage context
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: triage-context
           path: /tmp/triage-context/
@@ -210,7 +217,7 @@ jobs:
       && needs.classify.outputs.skip_comment != 'true'
     steps:
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -264,7 +271,7 @@ jobs:
           echo "Total files: $(find app-extracted -type f | wc -l)"
 
       - name: Upload reference source
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: reference-source
           path: /tmp/ref-source/app-extracted/
@@ -283,10 +290,10 @@ jobs:
       has_findings: ${{ steps.investigate.outputs.has_findings }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -294,13 +301,13 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Download triage context
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: triage-context
           path: /tmp/triage-context/
 
       - name: Download reference source
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: reference-source
           path: /tmp/ref-source/app-extracted/
@@ -344,11 +351,14 @@ jobs:
             cat << 'BODY'
 
           ## How This Project Patches Upstream Code
-          IMPORTANT: All fixes to the original JavaScript are applied via sed/regex in build.sh.
+          IMPORTANT: All fixes to the original JavaScript are applied via sed/regex in scripts/patches/*.sh.
+          Each subsystem owns its own file — tray.sh, cowork.sh, claude-code.sh, quick-window.sh,
+          titlebar.sh, app-asar.sh — with shared helpers in scripts/patches/_common.sh.
+          build.sh is a ~300-line orchestrator that sources these modules in order.
           Variable and function names are MINIFIED and change between releases.
           Patches must use regex patterns that match both minified and beautified spacing.
           Variable names are extracted dynamically with grep -oP, never hardcoded.
-          See build.sh for examples of existing patches (search for patch_ functions).
+          See scripts/patches/*.sh for examples of existing patches (search for patch_ functions).
           The wrapper files (frame-fix-wrapper.js, frame-fix-entry.js) intercept require('electron')
           and can patch BrowserWindow defaults without touching minified code.
 
@@ -357,10 +367,11 @@ jobs:
           ### All bugs are ours to fix
           This project's goal is to take a working Anthropic product and make it work
           on Linux. Every bug is something we can investigate and potentially patch.
-          Check build.sh patches first for bugs in patched areas (cowork, tray, frame,
-          platform checks, window decorations). Read the relevant patch_ function and
-          trace what it modifies. If a behavior difference exists between Windows/macOS
-          and our Linux build, that is a gap in our patching.
+          Check scripts/patches/*.sh first for bugs in patched areas (cowork.sh for cowork,
+          tray.sh for tray, titlebar.sh or quick-window.sh for window decorations, app-asar.sh
+          for platform checks / frame). Read the relevant patch_ function and trace what it
+          modifies. If a behavior difference exists between Windows/macOS and our Linux build,
+          that is a gap in our patching.
 
           ### Verify before stating
           Only state facts you verified by reading actual code or running commands.
@@ -392,7 +403,7 @@ jobs:
           - The exact anchor strings or regex patterns to locate the target code in minified source
           - What the sed replacement should do (insert, wrap, modify)
           - Any variable names that need dynamic extraction (with the grep -oP pattern to extract them)
-          - Whether the fix belongs in build.sh (sed patch) or frame-fix-wrapper.js (Electron intercept)
+          - Whether the fix belongs in scripts/patches/*.sh (sed patch) or frame-fix-wrapper.js (Electron intercept)
           - Surrounding context (what comes before/after the target) to make the regex unique
           The goal is to give enough context that an agent can write the patch without re-reading the source.
           BODY
@@ -423,7 +434,7 @@ jobs:
 
       - name: Upload investigation findings
         if: steps.investigate.outputs.has_findings == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: investigation-findings
           path: /tmp/investigation.txt
@@ -445,7 +456,7 @@ jobs:
             -o /tmp/voice-profile.md
 
       - name: Upload voice profile
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: voice-profile
           path: /tmp/voice-profile.md
@@ -468,10 +479,10 @@ jobs:
       comment_posted: ${{ steps.post.outputs.comment_posted }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -479,21 +490,21 @@ jobs:
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Download triage context
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: triage-context
           path: /tmp/triage-context/
 
       - name: Download investigation findings
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: investigation-findings
           path: /tmp/investigation/
 
       - name: Download voice profile
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: voice-profile
           path: /tmp/voice/
@@ -606,7 +617,7 @@ jobs:
       && needs.classify.result == 'success'
     steps:
       - name: Download triage context
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: triage-context
           path: /tmp/triage-context/

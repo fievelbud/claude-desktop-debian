@@ -6,19 +6,9 @@ This project provides build scripts to run Claude Desktop natively on Linux syst
 
 ---
 
-> **⚠️ EXPERIMENTAL: Cowork Mode Support**
-> Cowork mode is **enabled by default** in this build with a pluggable isolation backend:
+> **⚠️ APT migration notice (April 2026)**
 >
-> | Backend | Isolation | Requirements |
-> |---------|-----------|-------------|
-> | **bubblewrap** (default) | Namespace sandbox | `bwrap` installed and functional |
-> | **host** (fallback) | None — runs directly on host | No additional requirements |
->
-> The best available backend is auto-detected at startup. Run `claude-desktop --doctor` to check which backend will be used and which dependencies are missing.
->
-> **Note:** The bubblewrap backend mounts your home directory as read-only (only the project working directory is writable). The host backend provides no isolation — use it only if you understand the security implications.
->
-> **KVM status:** The KVM/QEMU backend code exists but is non-functional — VM file downloads are disabled on Linux to prevent a checksum loop (#337). The backend code remains for potential future use.
+> The APT/DNF repo moved to `pkg.claude-desktop-debian.dev` (#493) — binaries are now served from GitHub Releases via a Cloudflare Worker so they don't hit the 100 MB per-file push cap on `gh-pages`. **DNF users are unaffected.** APT users on the legacy `aaddrick.github.io` sources.list will see a scheme-downgrade error on `apt update`. [One-line `sed` fix](#migrating-from-the-old-aaddrickgithubio-url).
 
 ---
 
@@ -50,10 +40,10 @@ Add the repository for automatic updates via `apt`:
 
 ```bash
 # Add the GPG key
-curl -fsSL https://aaddrick.github.io/claude-desktop-debian/KEY.gpg | sudo gpg --dearmor -o /usr/share/keyrings/claude-desktop.gpg
+curl -fsSL https://pkg.claude-desktop-debian.dev/KEY.gpg | sudo gpg --dearmor -o /usr/share/keyrings/claude-desktop.gpg
 
 # Add the repository
-echo "deb [signed-by=/usr/share/keyrings/claude-desktop.gpg arch=amd64,arm64] https://aaddrick.github.io/claude-desktop-debian stable main" | sudo tee /etc/apt/sources.list.d/claude-desktop.list
+echo "deb [signed-by=/usr/share/keyrings/claude-desktop.gpg arch=amd64,arm64] https://pkg.claude-desktop-debian.dev stable main" | sudo tee /etc/apt/sources.list.d/claude-desktop.list
 
 # Update and install
 sudo apt update
@@ -68,13 +58,30 @@ Add the repository for automatic updates via `dnf`:
 
 ```bash
 # Add the repository
-sudo curl -fsSL https://aaddrick.github.io/claude-desktop-debian/rpm/claude-desktop.repo -o /etc/yum.repos.d/claude-desktop.repo
+sudo curl -fsSL https://pkg.claude-desktop-debian.dev/rpm/claude-desktop.repo -o /etc/yum.repos.d/claude-desktop.repo
 
 # Install
 sudo dnf install claude-desktop
 ```
 
 Future updates will be installed automatically with your regular system updates (`sudo dnf upgrade`).
+
+#### Migrating from the old `aaddrick.github.io` URL
+
+If you installed claude-desktop before April 2026, your repo config points at `https://aaddrick.github.io/claude-desktop-debian`. That URL now auto-redirects to `pkg.claude-desktop-debian.dev` — DNF follows the redirect transparently, but **apt refuses it as a security downgrade**, so `apt update` fails. Update your sources list to the new URL:
+
+```bash
+# APT (Debian/Ubuntu)
+sudo sed -i 's|https://aaddrick\.github\.io/claude-desktop-debian|https://pkg.claude-desktop-debian.dev|g' \
+  /etc/apt/sources.list.d/claude-desktop.list
+sudo apt update
+
+# DNF (Fedora/RHEL) — optional refresh; the old URL still works but pointing directly at the new host is cleaner
+sudo curl -fsSL https://pkg.claude-desktop-debian.dev/rpm/claude-desktop.repo \
+  -o /etc/yum.repos.d/claude-desktop.repo
+```
+
+Background: binaries for recent releases are no longer committed to the `gh-pages` branch — `.deb` files grew past GitHub's 100 MB per-file cap (#493). The new URL is fronted by a small Cloudflare Worker that serves the existing metadata directly and 302-redirects package downloads to the corresponding GitHub Release asset. Bandwidth and package bytes still come from GitHub; the Worker just handles the routing.
 
 ### Using AUR (Arch Linux)
 
@@ -174,7 +181,10 @@ Special thanks to:
   - Quick window submit fix
 - **[janfrederik](https://github.com/janfrederik)** for the `--exe` flag to use a local installer
 - **[MrEdwards007](https://github.com/MrEdwards007)** for discovering the OAuth token cache fix
-- **[lizthegrey](https://github.com/lizthegrey)** for version update contributions
+- **[lizthegrey](https://github.com/lizthegrey)**
+  - Version update contributions
+  - Close-to-tray on Linux to keep in-app schedulers, MCP servers, and the tray icon alive across window close
+  - "Run on startup" persistence on Linux via XDG Autostart, fixing the toggle that would silently revert
 - **[mathys-lopinto](https://github.com/mathys-lopinto)**
   - AUR package
   - Automated deployment
@@ -199,8 +209,12 @@ Special thanks to:
   - Detailed analysis of the CI release pipeline failure caused by runner kills during compare-releases
   - Diagnosing the session-start hook sudo blocking issue with three solution approaches
 - **[chukfinley](https://github.com/chukfinley)** for experimental Cowork mode support on Linux
-- **[CyPack](https://github.com/CyPack)** for orphaned cowork daemon cleanup on startup
-- **[IliyaBrook](https://github.com/IliyaBrook)** for fixing the platform patch for Claude Desktop >= 1.1.3541 arm64 refactor
+- **[CyPack](https://github.com/CyPack)**
+  - Orphaned cowork daemon cleanup on startup
+  - `COWORK_VM_BACKEND` documentation, Cowork troubleshooting sections, and unknown-value warning in `--doctor`
+- **[IliyaBrook](https://github.com/IliyaBrook)**
+  - Fixing the platform patch for Claude Desktop >= 1.1.3541 arm64 refactor
+  - Fixing the duplicate tray icon on OS theme change with an in-place `setImage`/`setContextMenu` fast-path that avoids the KDE Plasma SNI re-registration race
 - **[MichaelMKenny](https://github.com/MichaelMKenny)**
   - Diagnosing the `$`-prefixed electron variable bug
   - Root cause analysis and workaround
@@ -218,6 +232,7 @@ Special thanks to:
   - Fixing the KVM startup blocker
   - Fixing RPC response id echoing for persistent connections
   - Configurable bwrap mount points via a dedicated Linux config file
+  - `{src, dst}` mount form in `coworkBwrapMounts` for distinct host/sandbox paths (e.g. persistent `/tmp` across Bash tool calls)
 - **[joekale-pp](https://github.com/joekale-pp)** for adding `--doctor` support to the RPM launcher
 - **[ecrevisseMiroir](https://github.com/ecrevisseMiroir)** for the bwrap backend sandbox isolation with tmpfs-based minimal root
 - **[arauhala](https://github.com/arauhala)** for detailed root cause analysis of the NixOS `isPackaged` regression
@@ -226,18 +241,29 @@ Special thanks to:
 - **[RayCharlizard](https://github.com/RayCharlizard)**
   - Detailed analysis of the self-referential `.mcpb-cache` symlink ELOOP bug
   - Fixing auto-memory path translation on HostBackend
+  - Fixing the `ion-dist` static asset copy for the `app://` protocol handler
 - **[reinthal](https://github.com/reinthal)** for fixing the NixOS build breakage caused by the nixpkgs `nodePackages` removal
 - **[gianluca-peri](https://github.com/gianluca-peri)**
   - Reporting the GNOME quit accessibility issue
   - Confirming tray behavior with AppIndicator
+- **[martin152](https://github.com/martin152)** for detailed diagnosis and a complete patch for three launcher cleanup bugs: `cleanup_orphaned_cowork_daemon` self-match, `cleanup_stale_cowork_socket` socat dependency no-op, and the same self-match in `--doctor`
+- **[hfyeh](https://github.com/hfyeh)** for diagnosing the Ubuntu 24.04 AppArmor unprivileged-userns block on Cowork bwrap and contributing the AppArmor profile workaround
+- **[davidamacey](https://github.com/davidamacey)** for identifying and fixing the XRDP GPU compositing blank-window issue on remote desktop sessions
+- **[pb3ck](https://github.com/pb3ck)** for diagnosing the Cowork `CLAUDE_CODE_OAUTH_TOKEN` env-strip bug with a working reference diff
+- **[Joost-Maker](https://github.com/Joost-Maker)** for fixing the `$e` fs reference crash in cowork Patch 9 on Claude Desktop 1.3109.0, introducing the `[$\w]+` identifier-capture pattern at `cowork.sh:482-501` (#421)
+- **[aJV99](https://github.com/aJV99)** for exporting `GDK_BACKEND=wayland` in native Wayland mode to fix XWayland fallback blur on HiDPI displays
+- **[Andrej730](https://github.com/Andrej730)**
+  - Quick-window regex readability refactor (`String.raw` + `escapeRegExp` helper)
+  - Fixing the visibility-function regex break on Claude Desktop 1.3883.0 (#496)
+- **[HumboldtJoker](https://github.com/HumboldtJoker)** for diagnosing the cowork Patch 2b silent failure on Claude Desktop 1.5354.0 — identifying that the log line was patched but session init still routed through the Swift addon (#553)
+- **[zabka](https://github.com/zabka)** for identifying that `cowork-vm-service.js` was never auto-spawned on Linux and contributing a systemd-unit workaround that scoped the daemon auto-launch fix (#445)
+- **[sirfaber](https://github.com/sirfaber)** for fixing the `$`-in-minified-identifier breakage of cowork Patch 2b (vm module assignment) and Patch 6 step 2 (retry-delay auto-launch) on Claude Desktop 1.5354.0 (#555)
+- **[ProfFlow](https://github.com/ProfFlow)** for re-fixing the RPM repodata signing regression by appending `!` to the keyid passed to `gpg --default-key`, forcing `repomd.xml` to be signed by the primary key instead of the auto-selected signing subkey (#566)
+- **[jslatten](https://github.com/jslatten)** for fixing the KDE Plasma Wayland launcher-grouping bug by setting `pkg.desktopName` in the packaged `app.asar`'s `package.json`, format-conditional so deb/rpm get `claude-desktop.desktop` and AppImage gets `io.github.aaddrick.claude-desktop-debian.desktop` (#562)
 
 ## Sponsorship
 
-Anthropic doesn't publish release notes for Claude Desktop. Each release here includes AI-generated notes that analyze code changes between versions. I wrote up how that process works if you're curious: [Generating Real Release Notes from Minified Electron Apps](https://nonconvexlabs.com/blog/generating-real-release-notes-from-minified-electron-apps).
-
-The analysis runs against Claude's API. Costs vary a lot depending on how big the update is. Recent releases have run between **$3.36 and $76.16 per release**.
-
-If this project is useful to you, consider [sponsoring on GitHub](https://github.com/sponsors/aaddrick) to help cover those costs.
+If this project is useful to you, consider [sponsoring on GitHub](https://github.com/sponsors/aaddrick).
 
 ## License
 
@@ -246,6 +272,14 @@ The build scripts in this repository are dual-licensed under:
 - Apache License 2.0 (see [LICENSE-APACHE](LICENSE-APACHE))
 
 The Claude Desktop application itself is subject to [Anthropic's Consumer Terms](https://www.anthropic.com/legal/consumer-terms).
+
+## Privacy
+
+This repository uses an automated triage bot that sends issue contents to Anthropic's API for classification and investigation when you file a bug report or feature request. The bot reads the issue body, title, and any referenced related issues; it does not follow URLs, execute code blocks, or read content outside the triggering issue.
+
+Do not include credentials, tokens, personal data, or anything you wouldn't put on a public issue tracker. If you post sensitive content and then edit it out, the bot's original read is preserved as a run artifact for audit — GitHub's UI hides the edit, but the bot's view of what you wrote is recoverable by maintainers.
+
+Full design and data inventory: [`docs/issue-triage/README.md`](docs/issue-triage/README.md).
 
 ## Contributing
 

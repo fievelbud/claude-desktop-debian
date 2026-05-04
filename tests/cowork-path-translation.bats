@@ -96,17 +96,58 @@ function resolvePluginRoot(pluginPath, mountBase) {
     return pluginPath;
 }
 
+function splitToolList(csv) {
+    const result = [];
+    if (!csv) return result;
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < csv.length; i++) {
+        const ch = csv[i];
+        if (ch === "(") depth++;
+        else if (ch === ")") depth = Math.max(0, depth - 1);
+        else if (ch === "," && depth === 0) {
+            result.push(csv.slice(start, i));
+            start = i + 1;
+        }
+    }
+    result.push(csv.slice(start));
+    return result;
+}
+
+function translateEmbeddedGuestPaths(csv, mountMap) {
+    if (!csv) return csv;
+    const out = [];
+    for (const entry of splitToolList(csv)) {
+        const m = entry.match(/^(\w+)\(([^)]+)\)$/);
+        if (!m) {
+            out.push(entry);
+            continue;
+        }
+        const tool = m[1];
+        const normalized = m[2].replace(/^\/+/, "/");
+        if (!normalized.startsWith("/sessions/")) {
+            out.push(entry);
+            continue;
+        }
+        const translated = translateGuestPath(normalized, mountMap || {});
+        if (!translated) continue;
+        out.push(`${tool}(${translated})`);
+    }
+    return out.join(",");
+}
+
 function cleanSpawnArgs(rawArgs, mountMap) {
     const cleanArgs = [];
     const guestPathFlags = new Set(["--add-dir", "--plugin-dir"]);
+    const toolListFlags = new Set(["--allowedTools", "--disallowedTools"]);
     for (let i = 0; i < rawArgs.length; i++) {
-        if (guestPathFlags.has(rawArgs[i]) &&
+        const flag = rawArgs[i];
+        const value = rawArgs[i + 1];
+
+        if (guestPathFlags.has(flag) &&
             i + 1 < rawArgs.length &&
-            rawArgs[i + 1].startsWith("/sessions/")) {
-            const flag = rawArgs[i];
-            let hostPath = translateGuestPath(
-                rawArgs[i + 1], mountMap || {}
-            );
+            value.startsWith("/sessions/")) {
+            let hostPath = translateGuestPath(value, mountMap || {});
             if (hostPath) {
                 if (flag === "--plugin-dir") {
                     hostPath = resolvePluginRoot(
@@ -120,9 +161,26 @@ function cleanSpawnArgs(rawArgs, mountMap) {
             i++;
             continue;
         }
-        cleanArgs.push(rawArgs[i]);
+
+        if (toolListFlags.has(flag) && i + 1 < rawArgs.length) {
+            cleanArgs.push(
+                flag,
+                translateEmbeddedGuestPaths(value, mountMap),
+            );
+            i++;
+            continue;
+        }
+
+        cleanArgs.push(flag);
     }
     return cleanArgs;
+}
+
+function findPrimaryMount(mountMap) {
+    if (!mountMap) return null;
+    return Object.keys(mountMap).find(
+        n => !n.startsWith(".") && n !== "uploads",
+    ) || null;
 }
 
 function resolveWorkDir(cwd, sharedCwdPath, mountMap) {
@@ -134,7 +192,12 @@ function resolveWorkDir(cwd, sharedCwdPath, mountMap) {
         if (translated) {
             workDir = translated;
         } else {
-            workDir = os.homedir();
+            const primaryMount = findPrimaryMount(mountMap);
+            if (primaryMount && mountMap[primaryMount]) {
+                workDir = mountMap[primaryMount];
+            } else {
+                workDir = os.homedir();
+            }
         }
     }
     if (!fs.existsSync(workDir)) {
@@ -147,6 +210,8 @@ const BLOCKED_ENV_KEYS = new Set([
     "CLAUDECODE", "ELECTRON_RUN_AS_NODE", "ELECTRON_NO_ASAR",
 ]);
 
+const FORWARDED_ENV_KEYS = ["CLAUDE_CODE_OAUTH_TOKEN"];
+
 function filterEnv(source, stripPrefixes = []) {
     const result = {};
     for (const [k, v] of Object.entries(source)) {
@@ -157,12 +222,22 @@ function filterEnv(source, stripPrefixes = []) {
     return result;
 }
 
-function buildSpawnEnv(appEnv, mountMap) {
+function buildBaseSpawnEnv(appEnv) {
     const mergedEnv = {
         ...filterEnv(process.env, ["CLAUDE_CODE_"]),
         ...filterEnv(appEnv || {}),
         TERM: "xterm-256color",
     };
+    for (const key of FORWARDED_ENV_KEYS) {
+        if (process.env[key] && mergedEnv[key] === undefined) {
+            mergedEnv[key] = process.env[key];
+        }
+    }
+    return mergedEnv;
+}
+
+function buildSpawnEnv(appEnv, mountMap) {
+    const mergedEnv = buildBaseSpawnEnv(appEnv);
     if (mergedEnv.CLAUDE_CONFIG_DIR &&
         mergedEnv.CLAUDE_CONFIG_DIR.startsWith("/sessions/")) {
         const translated = translateGuestPath(
@@ -540,6 +615,177 @@ assertDeepEqual(result,
 	[[ "$status" -eq 0 ]]
 }
 
+@test "cleanSpawnArgs: translates --allowedTools embedded guest paths" {
+	run node -e "${NODE_PREAMBLE}
+const result = cleanSpawnArgs(
+    [
+        '--allowedTools',
+        'Read,Edit,Edit(//sessions/abc/mnt/.auto-memory/**),Write(//sessions/abc/mnt/.auto-memory/**)'
+    ],
+    {'.auto-memory': '/host/memory'}
+);
+assertDeepEqual(result,
+    [
+        '--allowedTools',
+        'Read,Edit,Edit(/host/memory/**),Write(/host/memory/**)'
+    ],
+    '--allowedTools translated, plain entries preserved');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "cleanSpawnArgs: translates --disallowedTools embedded guest paths" {
+	run node -e "${NODE_PREAMBLE}
+const result = cleanSpawnArgs(
+    [
+        '--disallowedTools',
+        'Bash(rm),Edit(//sessions/abc/mnt/data/secret/**)'
+    ],
+    {'data': '/host/data'}
+);
+assertDeepEqual(result,
+    [
+        '--disallowedTools',
+        'Bash(rm),Edit(/host/data/secret/**)'
+    ],
+    '--disallowedTools translated');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+# =============================================================================
+# splitToolList
+# =============================================================================
+
+@test "splitToolList: empty / null input" {
+	run node -e "${NODE_PREAMBLE}
+assertDeepEqual(splitToolList(''), [], 'empty string -> []');
+assertDeepEqual(splitToolList(null), [], 'null -> []');
+assertDeepEqual(splitToolList(undefined), [], 'undefined -> []');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "splitToolList: simple CSV with no parens" {
+	run node -e "${NODE_PREAMBLE}
+assertDeepEqual(
+    splitToolList('Read,Edit,Write'),
+    ['Read', 'Edit', 'Write'],
+    'plain CSV');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "splitToolList: respects parentheses around commas" {
+	run node -e "${NODE_PREAMBLE}
+assertDeepEqual(
+    splitToolList('Bash(npm test, npm build),Edit,Read'),
+    ['Bash(npm test, npm build)', 'Edit', 'Read'],
+    'commas inside parens are preserved');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "splitToolList: handles trailing entry without comma" {
+	run node -e "${NODE_PREAMBLE}
+assertDeepEqual(
+    splitToolList('A,B(c,d)'),
+    ['A', 'B(c,d)'],
+    'final entry includes nested commas');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+# =============================================================================
+# translateEmbeddedGuestPaths
+# =============================================================================
+
+@test "translateEmbeddedGuestPaths: passes through entries without parens" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    translateEmbeddedGuestPaths(
+        'Read,Edit,Write',
+        {'.auto-memory': '/host/memory'}
+    ),
+    'Read,Edit,Write',
+    'plain tool names unchanged');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "translateEmbeddedGuestPaths: translates Edit() with double-slash guest path" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    translateEmbeddedGuestPaths(
+        'Edit(//sessions/abc/mnt/.auto-memory/**)',
+        {'.auto-memory': '/host/memory'}
+    ),
+    'Edit(/host/memory/**)',
+    'leading // normalized and translated');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "translateEmbeddedGuestPaths: translates entry with single-slash guest path" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    translateEmbeddedGuestPaths(
+        'Write(/sessions/abc/mnt/.auto-memory/**)',
+        {'.auto-memory': '/host/memory'}
+    ),
+    'Write(/host/memory/**)',
+    'single-slash variant also translated');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "translateEmbeddedGuestPaths: drops entries whose mount is unknown" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    translateEmbeddedGuestPaths(
+        'Read,Edit(//sessions/abc/mnt/unknown/**),Write',
+        {'.auto-memory': '/host/memory'}
+    ),
+    'Read,Write',
+    'unresolvable entry is dropped, others retained');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "translateEmbeddedGuestPaths: leaves non-/sessions paths alone" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    translateEmbeddedGuestPaths(
+        'Bash(rm),Edit(/home/user/explicit/file)',
+        {'.auto-memory': '/host/memory'}
+    ),
+    'Bash(rm),Edit(/home/user/explicit/file)',
+    'host paths and non-paths unchanged');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "translateEmbeddedGuestPaths: handles MCP-style tool names with underscores" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    translateEmbeddedGuestPaths(
+        'mcp__server__tool(//sessions/abc/mnt/data/**)',
+        {'data': '/host/data'}
+    ),
+    'mcp__server__tool(/host/data/**)',
+    'mcp-style tool name preserved');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "translateEmbeddedGuestPaths: empty / null input" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(translateEmbeddedGuestPaths('', {}), '', 'empty -> empty');
+assertEqual(translateEmbeddedGuestPaths(null, {}), null, 'null -> null');
+"
+	[[ "$status" -eq 0 ]]
+}
+
 # =============================================================================
 # resolvePluginRoot
 # =============================================================================
@@ -711,6 +957,110 @@ assertEqual(
 	[[ "$status" -eq 0 ]]
 }
 
+@test "resolveWorkDir: session-root cwd uses primary user mount" {
+	mkdir -p "${TEST_TMP}/project"
+
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    resolveWorkDir(
+        '/sessions/bold-sharp-clarke',
+        null,
+        {'project': '${TEST_TMP}/project'}
+    ),
+    '${TEST_TMP}/project',
+    'session-root falls through to primary mount');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "resolveWorkDir: session-root cwd skips dotfile and uploads mounts" {
+	mkdir -p "${TEST_TMP}/project"
+
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    resolveWorkDir(
+        '/sessions/abc',
+        null,
+        {
+            '.claude': '${TEST_TMP}/dotclaude',
+            '.auto-memory': '${TEST_TMP}/automem',
+            'uploads': '${TEST_TMP}/uploads',
+            'project': '${TEST_TMP}/project'
+        }
+    ),
+    '${TEST_TMP}/project',
+    'dotfile and uploads mounts are skipped');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "resolveWorkDir: session-root cwd with no user mount falls back to home" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    resolveWorkDir(
+        '/sessions/abc',
+        null,
+        {
+            '.claude': '/host/dotclaude',
+            'uploads': '/host/uploads'
+        }
+    ),
+    os.homedir(),
+    'no user mount -> homedir fallback');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+# =============================================================================
+# findPrimaryMount
+# =============================================================================
+
+@test "findPrimaryMount: returns null for null mountMap" {
+	run node -e "${NODE_PREAMBLE}
+assert(findPrimaryMount(null) === null, 'null mountMap');
+assert(findPrimaryMount(undefined) === null, 'undefined mountMap');
+assert(findPrimaryMount({}) === null, 'empty mountMap');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "findPrimaryMount: returns first non-dotfile non-uploads key" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    findPrimaryMount({'project': '/h/p'}),
+    'project',
+    'single user mount');
+assertEqual(
+    findPrimaryMount({
+        '.claude': '/h/c',
+        'uploads': '/h/u',
+        'project': '/h/p'
+    }),
+    'project',
+    'skips dotfiles and uploads');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "findPrimaryMount: returns null when all mounts are dotfiles or uploads" {
+	run node -e "${NODE_PREAMBLE}
+assert(
+    findPrimaryMount({'.claude': '/h/c', 'uploads': '/h/u'}) === null,
+    'no user mount -> null');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "findPrimaryMount: insertion order determines primary when multiple exist" {
+	run node -e "${NODE_PREAMBLE}
+assertEqual(
+    findPrimaryMount({'first': '/h/1', 'second': '/h/2'}),
+    'first',
+    'first inserted user mount wins');
+"
+	[[ "$status" -eq 0 ]]
+}
+
 # =============================================================================
 # buildSpawnEnv
 # =============================================================================
@@ -776,6 +1126,55 @@ assertEqual(env.GOOD_VAR, 'keep', 'non-blocked kept');
 	run node -e "${NODE_PREAMBLE}
 const env = buildSpawnEnv({ TERM: 'dumb' }, {});
 assertEqual(env.TERM, 'xterm-256color', 'TERM forced');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+# Regression coverage for issue #482: the CLAUDE_CODE_ prefix strip used to
+# remove CLAUDE_CODE_OAUTH_TOKEN from process.env, severing the only auth
+# channel available to the in-VM claude binary.
+
+@test "buildSpawnEnv: forwards CLAUDE_CODE_OAUTH_TOKEN from process.env" {
+	CLAUDE_CODE_OAUTH_TOKEN='tok-from-daemon' run node -e "${NODE_PREAMBLE}
+const env = buildSpawnEnv({}, {});
+assertEqual(env.CLAUDE_CODE_OAUTH_TOKEN,
+    'tok-from-daemon',
+    'OAUTH_TOKEN forwarded from process.env');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildSpawnEnv: appEnv CLAUDE_CODE_OAUTH_TOKEN wins over process.env" {
+	CLAUDE_CODE_OAUTH_TOKEN='tok-from-daemon' run node -e "${NODE_PREAMBLE}
+const env = buildSpawnEnv(
+    { CLAUDE_CODE_OAUTH_TOKEN: 'tok-from-app' },
+    {}
+);
+assertEqual(env.CLAUDE_CODE_OAUTH_TOKEN,
+    'tok-from-app',
+    'appEnv token takes precedence');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildSpawnEnv: explicit empty appEnv token wins over process.env" {
+	CLAUDE_CODE_OAUTH_TOKEN='tok-from-daemon' run node -e "${NODE_PREAMBLE}
+const env = buildSpawnEnv(
+    { CLAUDE_CODE_OAUTH_TOKEN: '' },
+    {}
+);
+assertEqual(env.CLAUDE_CODE_OAUTH_TOKEN,
+    '',
+    'explicit empty-string preserved');
+"
+	[[ "$status" -eq 0 ]]
+}
+
+@test "buildSpawnEnv: still strips unrelated CLAUDE_CODE_* from process.env" {
+	CLAUDE_CODE_SSE_PORT='9999' run node -e "${NODE_PREAMBLE}
+const env = buildSpawnEnv({}, {});
+assert(!('CLAUDE_CODE_SSE_PORT' in env),
+    'non-allowlisted CLAUDE_CODE_ var still stripped');
 "
 	[[ "$status" -eq 0 ]]
 }

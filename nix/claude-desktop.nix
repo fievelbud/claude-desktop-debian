@@ -16,16 +16,16 @@
 }:
 let
   pname = "claude-desktop";
-  version = "1.1617.0";
+  version = "1.5354.0";
 
   srcs = {
     x86_64-linux = fetchurl {
-      url = "https://downloads.claude.ai/releases/win32/x64/1.1617.0/Claude-8d63450d9eae59f17102abdee7bf0759472f30a2.exe";
-      hash = "sha256-QMxHCTC4cZFf8ESw0jdNRqxyTN7pyMIv5DKgZYVHjAs=";
+      url = "https://downloads.claude.ai/releases/win32/x64/1.5354.0/Claude-9a9e3d5a4a368f0f49a80dc303b0ed1a18bfedad.exe";
+      hash = "sha256-5hnHvTtnRqcwfr7+UJv+RHoUOu2X5sf2Zmd7Nqa2ulQ=";
     };
     aarch64-linux = fetchurl {
-      url = "https://downloads.claude.ai/releases/win32/arm64/1.1617.0/Claude-8d63450d9eae59f17102abdee7bf0759472f30a2.exe";
-      hash = "sha256-WYqGebzjSk8jd+NnxWeNvcPucIWY33hP28VjKjFnElM=";
+      url = "https://downloads.claude.ai/releases/win32/arm64/1.5354.0/Claude-9a9e3d5a4a368f0f49a80dc303b0ed1a18bfedad.exe";
+      hash = "sha256-v33l1sASVC/q331cqnenLfzqGyRRLpptKOAEukrioR0=";
     };
   };
 
@@ -162,6 +162,14 @@ stdenvNoCC.mkDerivation {
       fi
     done
 
+    # Install ion-dist static assets (app:// protocol handler root for
+    # Third-Party Inference setup — see issue #488)
+    if [[ -d build/electron-app/nix-resources/ion-dist ]]; then
+      cp -r build/electron-app/nix-resources/ion-dist \
+        $electron_tree/resources/
+      echo "Installed cowork resource: ion-dist"
+    fi
+
     # Install locale JSON files into resources
     for locale_json in build/claude-extract/lib/net45/resources/*-*.json; do
       [[ -f "$locale_json" ]] \
@@ -198,9 +206,12 @@ stdenvNoCC.mkDerivation {
       fi
     done
 
-    # Install shared launcher library
+    # Install shared launcher library + doctor (launcher-common.sh
+    # sources doctor.sh at runtime, so both must live in the same dir)
     install -Dm755 ${sourceRoot}/scripts/launcher-common.sh \
       $out/lib/claude-desktop/launcher-common.sh
+    install -Dm755 ${sourceRoot}/scripts/doctor.sh \
+      $out/lib/claude-desktop/doctor.sh
 
     # Install .desktop file
     mkdir -p $out/share/applications
