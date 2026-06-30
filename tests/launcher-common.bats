@@ -18,6 +18,46 @@ has_electron_arg() {
 	return 1
 }
 
+# Count how many electron_args entries start with --enable-features=.
+# Chromium honours only the last such switch, so the launcher must emit
+# exactly one; this lets tests assert that invariant.
+count_enable_features() {
+	local n=0 arg
+	for arg in "${electron_args[@]}"; do
+		[[ $arg == --enable-features=* ]] && ((n++))
+	done
+	echo "$n"
+}
+
+# Install a dbus-send stub at the front of PATH.
+#   kwallet6   — echoes 'boolean true', exits 0 (kwallet6 detectable)
+#   secrets-ok — fails for kwalletd6 dest, succeeds for all other dests
+#   fail       — always exits 1 with no output (no keyring accessible)
+_stub_dbus_send() {
+	mkdir -p "$TEST_TMP/bin"
+	case "${1:-fail}" in
+		kwallet6)
+			cat > "$TEST_TMP/bin/dbus-send" <<'STUB'
+#!/usr/bin/env bash
+echo 'boolean true'
+STUB
+			;;
+		secrets-ok)
+			cat > "$TEST_TMP/bin/dbus-send" <<'STUB'
+#!/usr/bin/env bash
+[[ "$*" == *kwalletd6* ]] && exit 1
+exit 0
+STUB
+			;;
+		*)
+			printf '#!/usr/bin/env bash\nexit 1\n' \
+				> "$TEST_TMP/bin/dbus-send"
+			;;
+	esac
+	chmod +x "$TEST_TMP/bin/dbus-send"
+	export PATH="$TEST_TMP/bin:$PATH"
+}
+
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -35,13 +75,25 @@ setup() {
 	unset CLAUDE_USE_WAYLAND
 	unset NIRI_SOCKET
 	unset XDG_CURRENT_DESKTOP
+	unset XDG_SESSION_TYPE
 	unset CLAUDE_MENU_BAR
 	unset CLAUDE_TITLEBAR_STYLE
 	unset COWORK_VM_BACKEND
 	unset ELECTRON_USE_SYSTEM_TITLE_BAR
+	unset GTK_IM_MODULE
+	unset XMODIFIERS
+	unset QT_IM_MODULE
+	unset CLAUDE_GTK_IM_MODULE
+	unset CLAUDE_PASSWORD_STORE
+	CLAUDE_PASSWORD_STORE='basic'
 
+	# Copy to temp dir so we can substitute the build-time placeholder
+	# and co-locate doctor.sh (sourced via BASH_SOURCE dirname).
+	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" "$TEST_TMP/launcher-common.sh"
+	cp "$SCRIPT_DIR/../scripts/doctor.sh" "$TEST_TMP/doctor.sh"
+	sed -i 's/@@WM_CLASS@@/Claude/' "$TEST_TMP/launcher-common.sh"
 	# shellcheck source=scripts/launcher-common.sh
-	source "$SCRIPT_DIR/../scripts/launcher-common.sh"
+	source "$TEST_TMP/launcher-common.sh"
 }
 
 teardown() {
@@ -84,6 +136,70 @@ teardown() {
 	run cat "$log_file"
 	[[ "${lines[0]}" == "test message one" ]]
 	[[ "${lines[1]}" == "test message two" ]]
+}
+
+# =============================================================================
+# log_session_env
+# =============================================================================
+
+@test "log_session_env: emits env={ ... } block with all required keys" {
+	setup_logging
+	XDG_SESSION_TYPE='wayland'
+	WAYLAND_DISPLAY='wayland-0'
+	DISPLAY=':0'
+	XDG_CURRENT_DESKTOP='KDE'
+	GTK_IM_MODULE='ibus'
+	XMODIFIERS='@im=ibus'
+	QT_IM_MODULE='ibus'
+	CLAUDE_USE_WAYLAND='1'
+	CLAUDE_TITLEBAR_STYLE='hybrid'
+	CLAUDE_PASSWORD_STORE='basic'
+	CLAUDE_GTK_IM_MODULE='xim'
+	CLAUDE_DISABLE_GPU='1'
+	log_session_env
+
+	run cat "$log_file"
+	# Exact-line match locks block structure (open/close braces on
+	# their own lines) and per-key formatting in one pass.
+	[[ "${lines[0]}"  == 'env={' ]]
+	[[ "${lines[1]}"  == '  XDG_SESSION_TYPE=wayland' ]]
+	[[ "${lines[2]}"  == '  WAYLAND_DISPLAY=wayland-0' ]]
+	[[ "${lines[3]}"  == '  DISPLAY=:0' ]]
+	[[ "${lines[4]}"  == '  XDG_CURRENT_DESKTOP=KDE' ]]
+	[[ "${lines[5]}"  == '  GTK_IM_MODULE=ibus' ]]
+	[[ "${lines[6]}"  == '  XMODIFIERS=@im=ibus' ]]
+	[[ "${lines[7]}"  == '  QT_IM_MODULE=ibus' ]]
+	[[ "${lines[8]}"  == '  CLAUDE_USE_WAYLAND=1' ]]
+	[[ "${lines[9]}"  == '  CLAUDE_TITLEBAR_STYLE=hybrid' ]]
+	[[ "${lines[10]}" == '  CLAUDE_PASSWORD_STORE=basic' ]]
+	[[ "${lines[11]}" == '  CLAUDE_GTK_IM_MODULE=xim' ]]
+	[[ "${lines[12]}" == '  CLAUDE_DISABLE_GPU=1' ]]
+	[[ "${lines[13]}" == '}' ]]
+}
+
+@test "log_session_env: unset/empty values render as 'KEY=' (no value)" {
+	setup_logging
+	# All vars unset by setup() except this one, which exercises the
+	# empty-string branch (must be indistinguishable from unset).
+	GTK_IM_MODULE=''
+	unset CLAUDE_PASSWORD_STORE
+	log_session_env
+
+	run cat "$log_file"
+	# Exact-line match proves the line ends right after '=' — a
+	# substring like *'KEY='* would also match 'KEY=value'.
+	[[ "${lines[1]}"  == '  XDG_SESSION_TYPE=' ]]
+	[[ "${lines[2]}"  == '  WAYLAND_DISPLAY=' ]]
+	[[ "${lines[3]}"  == '  DISPLAY=' ]]
+	[[ "${lines[4]}"  == '  XDG_CURRENT_DESKTOP=' ]]
+	[[ "${lines[5]}"  == '  GTK_IM_MODULE=' ]]
+	[[ "${lines[6]}"  == '  XMODIFIERS=' ]]
+	[[ "${lines[7]}"  == '  QT_IM_MODULE=' ]]
+	[[ "${lines[8]}"  == '  CLAUDE_USE_WAYLAND=' ]]
+	[[ "${lines[9]}"  == '  CLAUDE_TITLEBAR_STYLE=' ]]
+	[[ "${lines[10]}" == '  CLAUDE_PASSWORD_STORE=' ]]
+	[[ "${lines[11]}" == '  CLAUDE_GTK_IM_MODULE=' ]]
+	[[ "${lines[12]}" == '  CLAUDE_DISABLE_GPU=' ]]
 }
 
 # =============================================================================
@@ -183,7 +299,7 @@ teardown() {
 	[[ $use_x11_on_wayland == false ]]
 }
 
-@test "detect_display_backend: non-Niri Wayland keeps XWayland default" {
+@test "detect_display_backend: non-Niri non-GNOME Wayland keeps XWayland default" {
 	WAYLAND_DISPLAY="wayland-0"
 	XDG_CURRENT_DESKTOP="sway"
 	setup_logging
@@ -201,9 +317,67 @@ teardown() {
 	[[ $use_x11_on_wayland == false ]]
 }
 
+@test "detect_display_backend: GNOME Wayland keeps XWayland default (not auto-flipped)" {
+	# GNOME native+portal is opt-in only; the default session stays on
+	# mature XWayland to avoid rendering/IME regressions (#404 portal
+	# route is opt-in via CLAUDE_USE_WAYLAND=1).
+	WAYLAND_DISPLAY="wayland-0"
+	XDG_CURRENT_DESKTOP="GNOME"
+	setup_logging
+	detect_display_backend
+	[[ $is_wayland == true ]]
+	[[ $use_x11_on_wayland == true ]]
+}
+
+@test "detect_display_backend: GNOME Wayland + CLAUDE_USE_WAYLAND=1 opts into native" {
+	WAYLAND_DISPLAY="wayland-0"
+	XDG_CURRENT_DESKTOP="ubuntu:GNOME"
+	CLAUDE_USE_WAYLAND=1
+	setup_logging
+	detect_display_backend
+	[[ $use_x11_on_wayland == false ]]
+}
+
+@test "detect_display_backend: GNOME on X11 (not Wayland) stays X11" {
+	DISPLAY=":0"
+	XDG_CURRENT_DESKTOP="GNOME"
+	setup_logging
+	detect_display_backend
+	[[ $is_wayland == false ]]
+	# use_x11_on_wayland is the default true; the auto-detect block is
+	# guarded by is_wayland so it never flips it on an X11 session.
+	[[ $use_x11_on_wayland == true ]]
+}
+
+@test "detect_display_backend: CLAUDE_USE_WAYLAND=0 forces XWayland on GNOME" {
+	WAYLAND_DISPLAY="wayland-0"
+	XDG_CURRENT_DESKTOP="GNOME"
+	CLAUDE_USE_WAYLAND=0
+	setup_logging
+	detect_display_backend
+	[[ $is_wayland == true ]]
+	[[ $use_x11_on_wayland == true ]]
+}
+
+@test "detect_display_backend: CLAUDE_USE_WAYLAND=0 forces XWayland on Niri" {
+	WAYLAND_DISPLAY="wayland-0"
+	NIRI_SOCKET="/tmp/niri.sock"
+	CLAUDE_USE_WAYLAND=0
+	setup_logging
+	detect_display_backend
+	[[ $use_x11_on_wayland == true ]]
+}
+
 # =============================================================================
 # build_electron_args
 # =============================================================================
+
+@test "build_electron_args: includes --class matching upstream productName" {
+	is_wayland=false
+	setup_logging
+	build_electron_args deb
+	has_electron_arg '--class=Claude'
+}
 
 @test "build_electron_args: X11 deb - only CustomTitlebar disabled" {
 	is_wayland=false
@@ -230,6 +404,17 @@ teardown() {
 	has_electron_arg '--no-sandbox'
 }
 
+@test "build_electron_args: Wayland XWayland deb - no GlobalShortcutsPortal feature" {
+	# The portal feature is inert under XWayland, so it must not be
+	# emitted on the X11-via-XWayland path.
+	is_wayland=true
+	use_x11_on_wayland=true
+	setup_logging
+	build_electron_args deb
+	# shellcheck disable=SC2314 # last command in test, ! works correctly
+	! has_electron_arg '*GlobalShortcutsPortal*'
+}
+
 @test "build_electron_args: Wayland native deb - includes wayland platform flags" {
 	is_wayland=true
 	use_x11_on_wayland=false
@@ -237,6 +422,45 @@ teardown() {
 	build_electron_args deb
 	has_electron_arg '--ozone-platform=wayland'
 	has_electron_arg '--enable-wayland-ime'
+	has_electron_arg '*WaylandWindowDecorations*'
+}
+
+@test "build_electron_args: Wayland native deb - enables GlobalShortcutsPortal (#404)" {
+	is_wayland=true
+	use_x11_on_wayland=false
+	setup_logging
+	build_electron_args deb
+	has_electron_arg '*GlobalShortcutsPortal*'
+}
+
+@test "build_electron_args: Wayland native deb - portal + ozone share one --enable-features" {
+	# Chromium honours only the last --enable-features switch, so the
+	# portal feature, UseOzonePlatform and WaylandWindowDecorations must
+	# all live in a single comma-joined flag — not separate switches.
+	is_wayland=true
+	use_x11_on_wayland=false
+	setup_logging
+	build_electron_args deb
+	# Exactly one --enable-features switch (Chromium honours only the
+	# last), carrying both features. Order inside the value is irrelevant
+	# to Chromium, so assert each subkey independently rather than with an
+	# ordered glob.
+	[[ $(count_enable_features) -eq 1 ]]
+	has_electron_arg '--enable-features=*UseOzonePlatform*'
+	has_electron_arg '--enable-features=*GlobalShortcutsPortal*'
+}
+
+@test "build_electron_args: hidden titlebar + native Wayland - one merged --enable-features" {
+	# WindowControlsOverlay (hidden titlebar) and the wayland/portal
+	# features must coexist in a single flag rather than clobber.
+	CLAUDE_TITLEBAR_STYLE=hidden
+	is_wayland=true
+	use_x11_on_wayland=false
+	setup_logging
+	build_electron_args deb
+	[[ $(count_enable_features) -eq 1 ]]
+	has_electron_arg '*WindowControlsOverlay*'
+	has_electron_arg '*GlobalShortcutsPortal*'
 	has_electron_arg '*WaylandWindowDecorations*'
 }
 
@@ -291,6 +515,48 @@ teardown() {
 @test "setup_electron_env: skips ELECTRON_USE_SYSTEM_TITLE_BAR for invalid value (falls back to hybrid)" {
 	CLAUDE_TITLEBAR_STYLE=garbage setup_electron_env
 	[[ $ELECTRON_USE_SYSTEM_TITLE_BAR == '1' ]]
+}
+
+@test "setup_electron_env: CLAUDE_GTK_IM_MODULE set propagates to GTK_IM_MODULE" {
+	setup_logging
+	GTK_IM_MODULE='ibus'
+	CLAUDE_GTK_IM_MODULE='xim'
+	setup_electron_env
+	[[ $GTK_IM_MODULE == 'xim' ]]
+	# Override is logged so users can verify it took effect
+	run cat "$log_file"
+	[[ $output == *'GTK_IM_MODULE override: ibus -> xim (via CLAUDE_GTK_IM_MODULE)'* ]]
+}
+
+@test "setup_electron_env: CLAUDE_GTK_IM_MODULE set logs <unset> when GTK_IM_MODULE was unset" {
+	setup_logging
+	# GTK_IM_MODULE unset by setup()
+	CLAUDE_GTK_IM_MODULE='xim'
+	setup_electron_env
+	[[ $GTK_IM_MODULE == 'xim' ]]
+	run cat "$log_file"
+	[[ $output == *'GTK_IM_MODULE override: <unset> -> xim (via CLAUDE_GTK_IM_MODULE)'* ]]
+}
+
+@test "setup_electron_env: CLAUDE_GTK_IM_MODULE unset leaves GTK_IM_MODULE alone" {
+	setup_logging
+	GTK_IM_MODULE='ibus'
+	# CLAUDE_GTK_IM_MODULE unset by setup()
+	setup_electron_env
+	[[ $GTK_IM_MODULE == 'ibus' ]]
+	# No override line should appear in the log
+	run cat "$log_file"
+	[[ $output != *'GTK_IM_MODULE override'* ]]
+}
+
+@test "setup_electron_env: CLAUDE_GTK_IM_MODULE empty leaves GTK_IM_MODULE alone" {
+	setup_logging
+	GTK_IM_MODULE='ibus'
+	CLAUDE_GTK_IM_MODULE=''
+	setup_electron_env
+	[[ $GTK_IM_MODULE == 'ibus' ]]
+	run cat "$log_file"
+	[[ $output != *'GTK_IM_MODULE override'* ]]
 }
 
 # =============================================================================
@@ -466,6 +732,219 @@ s.close()
 }
 
 # =============================================================================
+# cleanup_orphaned_cowork_daemon
+#
+# Reaps a cowork-vm-service daemon left behind by a crashed UI, but only
+# when no live Claude UI is running. pgrep/kill/sleep are stubbed; the
+# "live UI" case uses a real background process so the /proc cmdline and
+# status reads resolve naturally without faking /proc.
+# =============================================================================
+
+@test "cleanup_orphaned_cowork_daemon: no daemon running — no action, no log" {
+	# Daemon pgrep finds nothing, so the function returns before any
+	# UI scan or kill.
+	pgrep() { return 1; }
+	kill() { echo "kill $*" >> "$TEST_TMP/kills"; }
+
+	setup_logging
+	run cleanup_orphaned_cowork_daemon
+	[[ $status -eq 0 ]]
+	[[ ! -f "$TEST_TMP/kills" ]]
+	[[ ! -f $log_file ]]
+}
+
+@test "cleanup_orphaned_cowork_daemon: live UI present — daemon left running" {
+	# A real background process stands in for the live Electron UI so
+	# the /proc cmdline and status reads resolve naturally. The UI
+	# scan fingerprints on the launcher-passed --class flag (since
+	# #700 app.asar no longer appears in any cmdline), so the
+	# stand-in's argv[0] is renamed to carry it via exec -a. Its state
+	# is sleeping (not T/t/Z), so the function treats it as a live UI
+	# and must NOT kill the daemon.
+	bash -c 'exec -a "--class=Claude" sleep 300' &
+	ui_pid=$!
+
+	# Match on "$*", not "$2": the UI scan passes -u <uid> and a `--`
+	# end-of-options separator before the pattern, so the pattern is
+	# not at a fixed argument position.
+	pgrep() {
+		if [[ $* == *cowork-vm-service* ]]; then
+			echo 4242
+		elif [[ $* == *--class=Claude* ]]; then
+			echo "$ui_pid"
+		fi
+	}
+	kill() { echo "kill $*" >> "$TEST_TMP/kills"; }
+
+	setup_logging
+	cleanup_orphaned_cowork_daemon
+	local rc=$?
+	builtin kill "$ui_pid" 2>/dev/null
+
+	[[ $rc -eq 0 ]]
+	# Daemon kill must never have been attempted.
+	[[ ! -f "$TEST_TMP/kills" ]]
+}
+
+@test "cleanup_orphaned_cowork_daemon: orphan exits on SIGTERM — no SIGKILL" {
+	# Daemon present, no live UI. The daemon disappears once SIGTERM is
+	# sent, so the escalation to SIGKILL must not fire.
+	local term_sent="$TEST_TMP/term_sent"
+	pgrep() {
+		if [[ $* == *cowork-vm-service* ]]; then
+			[[ -f $term_sent ]] && return 1
+			echo 4242
+		else
+			# UI scan (--class fingerprint): no live UI.
+			return 1
+		fi
+	}
+	kill() {
+		echo "kill $*" >> "$TEST_TMP/kills"
+		# A plain SIGTERM ($1 is the PID, not -KILL) reaps the daemon.
+		[[ $1 == -KILL ]] || : > "$term_sent"
+	}
+	sleep() { :; }
+
+	setup_logging
+	# Via `run` so the function's internal `((_wait++))` (which returns 1
+	# when _wait starts at 0) doesn't trip bats' errexit. Production has
+	# no set -e, so this is a harness concern, not a code defect.
+	run cleanup_orphaned_cowork_daemon
+
+	grep -q 'Killed orphaned cowork-vm-service daemon (PIDs: 4242)' \
+		"$log_file"
+	# Negative assertions via `run` + status: a bare `! grep` that isn't
+	# the last command does not fail a bats test (SC2314), so it would be
+	# a hollow check.
+	run grep -q 'SIGKILL' "$log_file"
+	[[ $status -ne 0 ]]
+	grep -q '^kill 4242$' "$TEST_TMP/kills"
+	run grep -qF -- '-KILL' "$TEST_TMP/kills"
+	[[ $status -ne 0 ]]
+}
+
+@test "cleanup_orphaned_cowork_daemon: orphan survives SIGTERM — escalates to SIGKILL" {
+	# Daemon never dies, so after the SIGTERM grace window the function
+	# escalates to SIGKILL and logs the SIGKILL variant.
+	pgrep() {
+		if [[ $* == *cowork-vm-service* ]]; then
+			echo 4242
+		else
+			# UI scan (--class fingerprint): no live UI.
+			return 1
+		fi
+	}
+	kill() { echo "kill $*" >> "$TEST_TMP/kills"; }
+	sleep() { :; }
+
+	setup_logging
+	# `run` for the same errexit reason as the SIGTERM test above.
+	run cleanup_orphaned_cowork_daemon
+
+	grep -q 'Killed orphaned cowork-vm-service daemon (SIGKILL, PIDs: 4242)' \
+		"$log_file"
+	grep -q '^kill 4242$' "$TEST_TMP/kills"
+	grep -q '^kill -KILL 4242$' "$TEST_TMP/kills"
+}
+
+# =============================================================================
+# cleanup_stale_desktop_helpers
+# =============================================================================
+
+@test "_desktop_helper_cmdline_matches: matches known Desktop helpers only" {
+	local config_dir="$XDG_CONFIG_HOME/Claude"
+
+	run _desktop_helper_cmdline_matches \
+		"/usr/lib/claude-desktop/node_modules/electron/dist/electron --type=utility --user-data-dir=$config_dir"
+	[[ $status -eq 0 ]]
+
+	# tr '\0' ' ' joins cmdline args with a trailing space, so the
+	# --user-data-dir arm anchors on "$config_dir " — exact dir only.
+	run _desktop_helper_cmdline_matches \
+		"/tmp/.mount_claudeXXXXXX/electron --type=utility --user-data-dir=$config_dir "
+	[[ $status -eq 0 ]]
+
+	run _desktop_helper_cmdline_matches \
+		"/tmp/.mount_claudeXXXXXX/electron --type=utility --user-data-dir=${config_dir}Dev "
+	[[ $status -ne 0 ]]
+
+	run _desktop_helper_cmdline_matches \
+		"/usr/lib/claude-desktop/node_modules/electron/dist/resources/app.asar.unpacked/cowork-vm-service.js"
+	[[ $status -eq 0 ]]
+
+	run _desktop_helper_cmdline_matches \
+		"node $config_dir/Claude Extensions/ant.dir.example/server.js"
+	[[ $status -eq 0 ]]
+
+	run _desktop_helper_cmdline_matches \
+		"/usr/lib/claude-desktop/node_modules/electron/dist/electron /usr/lib/claude-desktop/node_modules/electron/dist/resources/app.asar"
+	[[ $status -ne 0 ]]
+
+	run _desktop_helper_cmdline_matches \
+		"claude --dangerously-skip-permissions"
+	[[ $status -ne 0 ]]
+
+	run _desktop_helper_cmdline_matches \
+		"/home/scott/dev/dude/core/agent-dude/dist/index.js mcp"
+	[[ $status -ne 0 ]]
+}
+
+@test "_claude_desktop_ui_cmdline_matches: keys on the --class fingerprint" {
+	# Live UI: launcher argv carries --class=$WM_CLASS (tr '\0' ' '
+	# leaves every argument space-terminated). Since #700 app.asar no
+	# longer appears in any cmdline, so the --class flag from
+	# build_electron_args is the only stable UI signature.
+	run _claude_desktop_ui_cmdline_matches \
+		"/usr/lib/claude-desktop/node_modules/electron/dist/electron --class=Claude --enable-features=WaylandWindowDecorations "
+	[[ $status -eq 0 ]]
+
+	# Another Electron app's asar path must not match.
+	run _claude_desktop_ui_cmdline_matches \
+		"/opt/other-electron-app/resources/app.asar "
+	[[ $status -ne 0 ]]
+
+	# Look-alike WM class is rejected by the trailing-space anchor.
+	run _claude_desktop_ui_cmdline_matches \
+		"/opt/claude-dev/electron --class=ClaudeDev "
+	[[ $status -ne 0 ]]
+
+	# Chromium helpers (--type=) never count as the UI, even if a
+	# --class flag leaked into their argv.
+	run _claude_desktop_ui_cmdline_matches \
+		"/usr/lib/claude-desktop/node_modules/electron/dist/electron --type=utility --user-data-dir=$XDG_CONFIG_HOME/Claude --class=Claude "
+	[[ $status -ne 0 ]]
+
+	# The cowork daemon never counts as the UI.
+	run _claude_desktop_ui_cmdline_matches \
+		"/usr/lib/claude-desktop/node_modules/electron/dist/resources/app.asar.unpacked/cowork-vm-service.js --class=Claude "
+	[[ $status -ne 0 ]]
+}
+
+@test "run_electron_and_cleanup: runs cleanup after Electron exits and preserves status" {
+	local marker="$TEST_TMP/cleanup-ran"
+	local electron="$TEST_TMP/electron"
+
+	cat > "$electron" <<'STUB'
+#!/usr/bin/env bash
+echo "electron argv: $*"
+exit 7
+STUB
+	chmod +x "$electron"
+
+	cleanup_after_electron_exit() {
+		touch "$marker"
+	}
+
+	setup_logging
+	run run_electron_and_cleanup "$electron" '--flag' 'value'
+	[[ $status -eq 7 ]]
+	[[ -f $marker ]]
+	run cat "$log_file"
+	[[ $output == *'electron argv: --flag value'* ]]
+}
+
+# =============================================================================
 # Doctor helper functions
 # =============================================================================
 
@@ -586,4 +1065,41 @@ s.close()
 	local result
 	result=$(_electron_version "$TEST_TMP/electron/electron") || true
 	[[ -z $result ]]
+}
+
+# =============================================================================
+# _detect_password_store
+# =============================================================================
+
+@test "_detect_password_store: CLAUDE_PASSWORD_STORE env var wins without calling dbus-send" {
+	CLAUDE_PASSWORD_STORE='mystore'
+	# Stub dbus-send to fail — the early-return path must not reach it.
+	_stub_dbus_send fail
+	run _detect_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == 'mystore' ]]
+}
+
+@test "_detect_password_store: falls back to kwallet6 when kwallet6 dbus-send call succeeds" {
+	unset CLAUDE_PASSWORD_STORE
+	_stub_dbus_send kwallet6
+	run _detect_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == 'kwallet6' ]]
+}
+
+@test "_detect_password_store: falls back to gnome-libsecret when kwallet6 fails but secrets ping succeeds" {
+	unset CLAUDE_PASSWORD_STORE
+	_stub_dbus_send secrets-ok
+	run _detect_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == 'gnome-libsecret' ]]
+}
+
+@test "_detect_password_store: falls back to basic when both dbus-send calls fail" {
+	unset CLAUDE_PASSWORD_STORE
+	_stub_dbus_send fail
+	run _detect_password_store
+	[[ $status -eq 0 ]]
+	[[ $output == 'basic' ]]
 }

@@ -4,6 +4,8 @@ This project provides build scripts to run Claude Desktop natively on Linux syst
 
 **Note:** This is an unofficial build script. For official support, please visit [Anthropic's website](https://www.anthropic.com). For issues with the build script or Linux implementation, please [open an issue](https://github.com/aaddrick/claude-desktop-debian/issues) in this repository.
 
+**Documentation:** Full docs at [`docs/index.md`](docs/index.md). Release history in [`CHANGELOG.md`](CHANGELOG.md). Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md). Security reports: [`SECURITY.md`](SECURITY.md).
+
 ---
 
 > **⚠️ APT migration notice (April 2026)**
@@ -135,7 +137,7 @@ Download the latest `.deb`, `.rpm`, or `.AppImage` from the [Releases page](http
 
 ### Building from Source
 
-See [docs/BUILDING.md](docs/BUILDING.md) for detailed build instructions.
+See [docs/building.md](docs/building.md) for detailed build instructions.
 
 ## Configuration
 
@@ -144,13 +146,13 @@ Model Context Protocol settings are stored in:
 ~/.config/Claude/claude_desktop_config.json
 ```
 
-For additional configuration options including environment variables and Wayland support, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+For additional configuration options including environment variables and Wayland support, see [docs/configuration.md](docs/configuration.md).
 
 ## Troubleshooting
 
 Run `claude-desktop --doctor` for built-in diagnostics that check common issues (display server, sandbox permissions, MCP config, stale locks, and more). It also reports cowork mode readiness — which isolation backend will be used, and which dependencies (KVM, QEMU, vsock, socat, virtiofsd, bubblewrap) are installed or missing.
 
-For additional troubleshooting, uninstallation instructions, and log locations, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+For additional troubleshooting, uninstallation instructions, and log locations, see [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Acknowledgments
 
@@ -185,6 +187,7 @@ Special thanks to:
   - Version update contributions
   - Close-to-tray on Linux to keep in-app schedulers, MCP servers, and the tray icon alive across window close
   - "Run on startup" persistence on Linux via XDG Autostart, fixing the toggle that would silently revert
+  - In-place package upgrade detection that watches `app.asar` for dpkg/rpm replacement and offers a click-to-restart notification, fixing the Quick Entry / About / Ctrl+Q symptom cluster from a running v(N) main process loading v(N+1) renderer assets (#564)
 - **[mathys-lopinto](https://github.com/mathys-lopinto)**
   - AUR package
   - Automated deployment
@@ -198,6 +201,9 @@ Special thanks to:
   - `--doctor` diagnostic command
   - SHA-256 checksum validation for downloads
   - Post-build integration tests for deb, rpm, and AppImage artifacts
+  - `tests.yml` CI workflow that runs the 186-test BATS suite on push and PR — the suite was inert in CI before this (#520)
+  - Isolating `cleanup_stale_cowork_socket` BATS from host `pgrep` state so the test passes on developer machines running Claude Desktop (#533, #534)
+  - Headless launch and `--doctor` smoke tests for the AppImage artifact, catching runtime regressions (frame-fix-wrapper syntax errors, asar patch breakage, `main` field mismatches) that the structural test missed (#592)
 - **[milog1994](https://github.com/milog1994)**
   - Popup detection
   - Functional stubs
@@ -227,6 +233,7 @@ Special thanks to:
   - node-pty derivation
   - CI auto-update
   - Fixing the flake package scoping regression
+  - Fixing the NixOS electron binary not being marked executable (#431, #581)
 - **[cbonnissent](https://github.com/cbonnissent)**
   - Reverse-engineering the Cowork VM guest RPC protocol
   - Fixing the KVM startup blocker
@@ -242,6 +249,8 @@ Special thanks to:
   - Detailed analysis of the self-referential `.mcpb-cache` symlink ELOOP bug
   - Fixing auto-memory path translation on HostBackend
   - Fixing the `ion-dist` static asset copy for the `app://` protocol handler
+  - `--doctor` diagnostic that detects the Ubuntu 24.04 AppArmor `apparmor_restrict_unprivileged_userns=1` block on bwrap, instead of letting it silently fall through to a hanging KVM probe (#351, #434)
+  - Documenting the upstream MCP double-spawn root-cause analysis in `docs/learnings/mcp-double-spawn.md` (#526, #527)
 - **[reinthal](https://github.com/reinthal)** for fixing the NixOS build breakage caused by the nixpkgs `nodePackages` removal
 - **[gianluca-peri](https://github.com/gianluca-peri)**
   - Reporting the GNOME quit accessibility issue
@@ -260,6 +269,36 @@ Special thanks to:
 - **[sirfaber](https://github.com/sirfaber)** for fixing the `$`-in-minified-identifier breakage of cowork Patch 2b (vm module assignment) and Patch 6 step 2 (retry-delay auto-launch) on Claude Desktop 1.5354.0 (#555)
 - **[ProfFlow](https://github.com/ProfFlow)** for re-fixing the RPM repodata signing regression by appending `!` to the keyid passed to `gpg --default-key`, forcing `repomd.xml` to be signed by the primary key instead of the auto-selected signing subkey (#566)
 - **[jslatten](https://github.com/jslatten)** for fixing the KDE Plasma Wayland launcher-grouping bug by setting `pkg.desktopName` in the packaged `app.asar`'s `package.json`, format-conditional so deb/rpm get `claude-desktop.desktop` and AppImage gets `io.github.aaddrick.claude-desktop-debian.desktop` (#562)
+- **[JoshuaVlantis](https://github.com/JoshuaVlantis)**
+  - RPM `chrome-sandbox` SUID via `%attr(4755, ...)` instead of a `%post` chmod scriptlet so the bit survives `--noscripts` and layered images (#539)
+  - `autoUpdater` no-op Proxy on Linux that defends against future feed activation, with a thenable allowlist masking `then`/`catch`/`finally`/`Symbol.toPrimitive`/`Symbol.iterator` to `undefined` (#567)
+  - Failing loudly on `npm install node-pty` failures instead of silently shipping the upstream Windows binaries, plus auto-installing `gcc`/`g++`/`make`/`python3` on minimal build environments (#401)
+  - Silencing the RPM "File listed twice" warning on `chrome-sandbox` by moving `chmod 4755` into `%install`, with thorough investigation of four `%exclude`-based alternatives (#610)
+  - Cleaning upstream Windows binaries from node-pty before staging the Linux build, preventing PE32+ orphans in the packaged asar (#597)
+- **[Hayao0819](https://github.com/Hayao0819)** for diagnosing the upstream `titleBarStyle:""` → `titleBarStyle:"hiddenInset"` migration that broke the About window render on GNOME/X11 and contributing the `isPopupWindow()` match extension (#481, #489)
+- **[michelsfun](https://github.com/michelsfun)** for reporting the cowork `ENAMETOOLONG` failure on eCryptfs-encrypted home directories with detailed `--doctor` output that pinpointed the short-NAME_MAX filesystem as the cause (#590)
+- **[proffalken](https://github.com/proffalken)** for the LUKS-volume + `pam_mount` workaround documented in `docs/troubleshooting.md`, restoring cowork support on legacy eCryptfs-encrypted home directories (#590)
+- **[phelps-matthew](https://github.com/phelps-matthew)** for fixing `CLAUDE_QUIT_ON_CLOSE=1` to actively quit via `app.quit()` instead of relying on the bundled handler that hardcodes hide-to-tray on Linux, with thorough root cause analysis and alternatives evaluation (#624, #623)
+- **[dubreal](https://github.com/dubreal)** for `--password-store` keyring detection that probes D-Bus for kwallet6 / gnome-libsecret at startup, fixing session persistence on KDE Plasma and other desktops where Electron's `safeStorage` was unavailable (#611, #593)
+- **[JustinJLeopard](https://github.com/JustinJLeopard)** for detecting missing electron binaries after Node 24's `extract-zip` silently no-ops, with an `unzip` fallback that recovers from the `@electron/get` cache (#631, #584)
+- **[tkrag](https://github.com/tkrag)** for diagnosing and fixing the X11 window-raise-on-hover bug under sloppy/focus-follows-mouse WMs, tracing the upstream `webContents.focus()` → `_NET_ACTIVE_WINDOW` path through three iterations of review (#589, #416)
+- **[maplefater](https://github.com/maplefater)** for re-anchoring the `addTrustedFolder` `.asar` guard on the `async addTrustedFolder(…)` method declaration after upstream 1.10628.x folded the log call into a comma-expression, keying both the parameter extraction and the injection point off the unminified method name so they can't drift apart (#685)
+- **[MitchSchwartz](https://github.com/MitchSchwartz)** for finding the second `app.asar` file-drop path — the `existsSync()` branch in the second-instance argv collector that #640 never guarded — and rejecting `.asar` paths there so the app no longer prompts to attach its own bundle on every taskbar reopen (#669, #668)
+- **[LiukScot](https://github.com/LiukScot)** for making the tray rebuild mutex trailing-edge so the startup dark-theme icon no longer latches black, and restoring the in-place `setImage` fast-path after upstream changed the context-menu wiring to a prebuilt menu object (#680, #679)
+- **[sabiut](https://github.com/sabiut)**
+  - BATS coverage for `cleanup_orphaned_cowork_daemon`, mutation-tested so the kill/escalation branches genuinely bite (#693)
+  - Fixing two false-green `--doctor` PASSes: an empty password store read as healthy, and a non-numeric `df` reading falling through to the PASS branch (#692)
+  - Extending the artifact launch smoke tests to arm64 on native `ubuntu-22.04-arm` runners, and re-keying the AppImage pkill sweep to `mount_claude` so escaped zygote/electron children stop leaking on the runner (#691)
+- **[jerem](https://github.com/jerem)** for routing Quick Entry's global shortcut through the XDG GlobalShortcuts portal on native Wayland, and merging all Chromium feature requests into a single `--enable-features=` switch — the old code silently clobbered `WindowControlsOverlay` (#690, #404)
+- **[caidejager](https://github.com/caidejager)** for diagnosing why Cowork's VM daemon never auto-launched on packages built under a restrictive umask — `app.asar.unpacked/` shipped mode `0700`, failing the auto-launch `existsSync()` guard — and normalizing install permissions across deb and AppImage, with `dpkg-deb --root-owner-group` closing a build-uid write exposure (#695)
+- **[JustinJLeopard](https://github.com/JustinJLeopard)** for the AppStream metainfo that surfaces the package in GNOME Software, KDE Discover, and App Center, wired into the deb, rpm, and AppImage builds (#633)
+- **[DhanushSantosh](https://github.com/DhanushSantosh)** for the GPU crash auto-recovery in the launcher: detecting a previous GPU-process FATAL in the launcher log and re-launching with safe GPU flags automatically, instead of leaving users to discover `CLAUDE_DISABLE_GPU=1` by hand (#666)
+- **[diarized](https://github.com/diarized)** for auto-installing scoped AppArmor userns profiles from the `.deb` postinst on Ubuntu 24.04+ — one for the bundled Electron binary (fixing the launch crash without `--no-sandbox`) and one for `/usr/bin/bwrap` (keeping Cowork's sandbox isolated instead of silently falling back to host-direct), automating the workaround from #351 (#687, #694)
+- **[emandel82](https://github.com/emandel82)** for root-causing the "Attach app.asar?" prompt: every launcher passed `app.asar` as a redundant Electron argument, which the second-instance argv collector treated as a file to open — removed at the source across all four package formats (#700, #696)
+- **[svankirk](https://github.com/svankirk)** for cleaning up Desktop helper processes after an explicit quit — a quit wrapper with signal forwarding and a bundle-keyed live-UI check, so closing the app no longer strands helper processes (#682)
+- **[pjordanandrsn](https://github.com/pjordanandrsn)** for re-deriving the cowork Linux patch suite against the upstream "yukonSilver" VM refactor (1.13576+) — re-anchoring the platform gate on `startVM`'s `yukonSilver.status` check after Patch 1's removed `darwin`/`win32` anchor started `process.exit(1)`'ing and dropping every subsequent cowork patch, fixing the build's "Verify cowork patches in shipped asar" gate (#736)
+- **[chrisw1005](https://github.com/chrisw1005)** for root-causing the Linux startup hang on Claude Desktop 1.13576+ — the unconditional `@ant/claude-native.readRegistryValues()` / `getWindowsElevationType()` enterprise-policy calls throwing a swallowed missing-method `TypeError` before window creation — via probe injection, and the complete Windows-only native stub fix (#729)
+- **[colonelpanic8](https://github.com/colonelpanic8)** for independently reproducing the same 1.13576+ startup hang and contributing BATS coverage for the Linux native stub (#730)
 
 ## Sponsorship
 

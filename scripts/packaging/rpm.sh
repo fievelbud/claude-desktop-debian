@@ -68,8 +68,12 @@ Type=Application
 Terminal=false
 Categories=Office;Utility;
 MimeType=x-scheme-handler/claude;
-StartupWMClass=Claude
+StartupWMClass=$WM_CLASS
 EOF
+
+# --- Stage AppStream metainfo (installed via %files block below) ---
+metainfo_name='io.github.aaddrick.claude-desktop-debian.metainfo.xml'
+cp "$script_dir/$metainfo_name" "$staging_dir/$metainfo_name" || exit 1
 
 # --- Create Launcher Script ---
 echo 'Creating launcher script...'
@@ -89,7 +93,12 @@ fi
 # Setup logging and environment
 setup_logging || exit 1
 setup_electron_env
+
+# App path
+app_path="/usr/lib/$package_name/node_modules/electron/dist/resources/app.asar"
+
 cleanup_orphaned_cowork_daemon
+cleanup_stale_desktop_helpers
 cleanup_stale_lock
 cleanup_stale_cowork_socket
 
@@ -97,6 +106,7 @@ cleanup_stale_cowork_socket
 log_message '--- Claude Desktop Launcher Start ---'
 log_message "Timestamp: \$(date)"
 log_message "Arguments: \$@"
+log_session_env
 
 # Check for display
 if ! check_display; then
@@ -114,12 +124,14 @@ fi
 
 # Determine Electron executable path
 electron_exec='electron'
+using_global_electron=false
 local_electron_path="/usr/lib/$package_name/node_modules/electron/dist/electron"
 if [[ -f \$local_electron_path ]]; then
 	electron_exec="\$local_electron_path"
 	log_message "Using local Electron: \$electron_exec"
 else
 	if command -v electron &> /dev/null; then
+		using_global_electron=true
 		log_message "Using global Electron: \$electron_exec"
 	else
 		log_message 'Error: Electron executable not found'
@@ -134,27 +146,35 @@ else
 	fi
 fi
 
-# App path
-app_path="/usr/lib/$package_name/node_modules/electron/dist/resources/app.asar"
-
 # Build electron args - use 'deb' type (same sandbox behavior)
 build_electron_args 'deb'
 
-# Add app path LAST
-electron_args+=("\$app_path")
+# Bundled Electron: app.asar sits in its default resources/ dir next
+# to the binary, so Electron auto-loads it. Passing the path again
+# makes Electron treat it as a file-to-open, which the app forwards
+# to its file-drop handler, producing a spurious "Attach app.asar?"
+# prompt on launch and on every taskbar reopen (the second-instance
+# argv path). Omitting it is the root-cause fix. See issue #696.
+# Global (PATH) Electron has no co-located app.asar and would boot
+# its default_app welcome screen instead — only there the explicit
+# app path is load-bearing and must stay.
+if [[ \$using_global_electron == true ]]; then
+	electron_args+=("\$app_path")
+	log_message "App (explicit arg, global Electron): \$app_path"
+else
+	log_message "App (auto-loaded by Electron): \$app_path"
+fi
 
 # Change to application directory
 app_dir="/usr/lib/$package_name"
 log_message "Changing directory to \$app_dir"
 cd "\$app_dir" || { log_message "Failed to cd to \$app_dir"; exit 1; }
 
-# Execute Electron
+# Execute Electron and keep the launcher alive so explicit quit can
+# clean up Desktop-owned helpers that outlive the Electron main process.
 log_message "Executing: \$electron_exec \${electron_args[*]} \$*"
-"\$electron_exec" "\${electron_args[@]}" "\$@" >> "\$log_file" 2>&1
-exit_code=\$?
-log_message "Electron exited with code: \$exit_code"
-log_message '--- Claude Desktop Launcher End ---'
-exit \$exit_code
+run_electron_and_cleanup "\$electron_exec" "\${electron_args[@]}" "\$@"
+exit \$?
 EOF
 chmod +x "$staging_dir/claude-desktop"
 
@@ -220,35 +240,44 @@ cp -r $app_staging_dir/app.asar.unpacked %{buildroot}/usr/lib/$package_name/node
 # Copy shared launcher library (launcher-common.sh sources doctor.sh
 # at runtime, so both must live in the same directory)
 cp $(dirname "$script_dir")/launcher-common.sh %{buildroot}/usr/lib/$package_name/
+sed -i "s/@@WM_CLASS@@/$WM_CLASS/" "%{buildroot}/usr/lib/$package_name/launcher-common.sh"
 cp $(dirname "$script_dir")/doctor.sh %{buildroot}/usr/lib/$package_name/
 
 # Install desktop entry
 install -Dm 644 $staging_dir/claude-desktop.desktop %{buildroot}/usr/share/applications/claude-desktop.desktop
 
+# Install AppStream metainfo (GNOME Software / KDE Discover)
+install -Dm 644 $staging_dir/$metainfo_name %{buildroot}/usr/share/metainfo/$metainfo_name
+
 # Install launcher script
 install -Dm 755 $staging_dir/claude-desktop %{buildroot}/usr/bin/claude-desktop
 
+# Normalize file modes — the cp -r above honors the build umask, and
+# the "-" first field of %defattr ships buildroot *file* modes verbatim
+# (only directory modes are forced to 0755), so a umask-077 build would
+# package an unreadable app.asar and a non-executable electron binary.
+# Must run before the chrome-sandbox chmod below so 4755 survives.
+find %{buildroot}/usr/lib/$package_name -type f -exec chmod u=rwX,go=rX {} +
+
+# Set the chrome-sandbox suid bit in the buildroot so the /usr/lib
+# directory walk in %files records 4755 in the payload (preserves #539
+# without the "File listed twice" warning #609 — see %files block).
+chmod 4755 %{buildroot}/usr/lib/$package_name/node_modules/electron/dist/chrome-sandbox
+
 %post
 # Update desktop database for MIME types
-update-desktop-database /usr/share/applications &> /dev/null || true
-
-# Set correct permissions for chrome-sandbox
-SANDBOX_PATH="/usr/lib/$package_name/node_modules/electron/dist/chrome-sandbox"
-if [ -f "\$SANDBOX_PATH" ]; then
-    echo "Setting chrome-sandbox permissions..."
-    chown root:root "\$SANDBOX_PATH" || echo "Warning: Failed to chown chrome-sandbox"
-    chmod 4755 "\$SANDBOX_PATH" || echo "Warning: Failed to chmod chrome-sandbox"
-fi
+update-desktop-database /usr/share/applications > /dev/null 2>&1 || true
 
 %postun
 # Update desktop database after removal
-update-desktop-database /usr/share/applications &> /dev/null || true
+update-desktop-database /usr/share/applications > /dev/null 2>&1 || true
 
 %files
 %defattr(-, root, root, 0755)
 %attr(755, root, root) /usr/bin/claude-desktop
 /usr/lib/$package_name
 /usr/share/applications/claude-desktop.desktop
+/usr/share/metainfo/$metainfo_name
 /usr/share/icons/hicolor/*/apps/claude-desktop.png
 SPECEOF
 
@@ -257,11 +286,23 @@ echo 'RPM spec file created'
 # --- Build RPM Package ---
 echo 'Building RPM package...'
 
-if ! rpmbuild --define "_topdir $rpmbuild_dir" \
+rpmbuild_log="$work_dir/rpmbuild.log"
+rpmbuild --define "_topdir $rpmbuild_dir" \
 	--define "_rpmdir $work_dir" \
 	--target "$rpm_arch" \
-	-bb "$rpmbuild_dir/SPECS/$package_name.spec"; then
+	-bb "$rpmbuild_dir/SPECS/$package_name.spec" 2>&1 |
+	tee "$rpmbuild_log"
+if (( PIPESTATUS[0] != 0 )); then
 	echo 'Failed to build RPM package' >&2
+	exit 1
+fi
+
+# Guard against re-introducing #609. The "File listed twice" warning
+# means %files has overlapping listings, and on modern rpmbuild any
+# %exclude workaround silently strips the file from the payload.
+if grep -qF 'File listed twice' "$rpmbuild_log"; then
+	echo 'rpmbuild emitted "File listed twice" — %files has overlapping listings (see #609)' >&2
+	grep -F 'File listed twice' "$rpmbuild_log" >&2
 	exit 1
 fi
 

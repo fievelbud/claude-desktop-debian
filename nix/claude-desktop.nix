@@ -16,16 +16,16 @@
 }:
 let
   pname = "claude-desktop";
-  version = "1.5354.0";
+  version = "1.15962.1";
 
   srcs = {
     x86_64-linux = fetchurl {
-      url = "https://downloads.claude.ai/releases/win32/x64/1.5354.0/Claude-9a9e3d5a4a368f0f49a80dc303b0ed1a18bfedad.exe";
-      hash = "sha256-5hnHvTtnRqcwfr7+UJv+RHoUOu2X5sf2Zmd7Nqa2ulQ=";
+      url = "https://downloads.claude.ai/releases/win32/x64/1.15962.1/Claude-1e236d9fa9efd21a5a0a66a7b70c028f48848604.exe";
+      hash = "sha256-nhf33HMllbWcwHy/7JvDvIJjVcr9u+0SR1628ITdbRY=";
     };
     aarch64-linux = fetchurl {
-      url = "https://downloads.claude.ai/releases/win32/arm64/1.5354.0/Claude-9a9e3d5a4a368f0f49a80dc303b0ed1a18bfedad.exe";
-      hash = "sha256-v33l1sASVC/q331cqnenLfzqGyRRLpptKOAEukrioR0=";
+      url = "https://downloads.claude.ai/releases/win32/arm64/1.15962.1/Claude-1e236d9fa9efd21a5a0a66a7b70c028f48848604.exe";
+      hash = "sha256-ih1kckFqvY16bjYxLjcIRtw1eyQubrVZCtaA7rWAKuU=";
     };
   };
 
@@ -124,6 +124,7 @@ stdenvNoCC.mkDerivation {
     # Copy the ELF binary — MUST be a real copy (not symlink) so that
     # /proc/self/exe resolves to our tree
     cp ${electronDir}/electron $electron_tree/electron
+    chmod +x $electron_tree/electron
 
     # Symlink everything else from electron-unwrapped
     for item in ${electronDir}/*; do
@@ -238,6 +239,7 @@ fi
 setup_logging || exit 1
 setup_electron_env
 cleanup_orphaned_cowork_daemon
+cleanup_stale_desktop_helpers
 cleanup_stale_lock
 cleanup_stale_cowork_socket
 
@@ -245,6 +247,7 @@ cleanup_stale_cowork_socket
 log_message '--- Claude Desktop Launcher Start (NixOS) ---'
 log_message "Timestamp: $(date)"
 log_message "Arguments: $@"
+log_session_env
 
 # Check for display
 if ! check_display; then
@@ -260,15 +263,20 @@ detect_display_backend
 # Build Electron arguments
 build_electron_args 'nix'
 
-# Add app path
-electron_args+=("$app_path")
+# Intentionally NOT appended: app.asar sits in Electron's default
+# resources/ dir next to the binary, so Electron auto-loads it. Passing
+# the path again makes Electron treat it as a file-to-open, which the
+# app forwards to its file-drop handler, producing a spurious
+# "Attach app.asar?" prompt on launch and on every taskbar reopen
+# (the second-instance argv path). Omitting it is the root-cause fix.
+# See issue #696.
+log_message "App (auto-loaded by Electron): $app_path"
 
-# Execute Electron
+# Execute Electron and keep the launcher alive so explicit quit can
+# clean up Desktop-owned helpers that outlive the Electron main process.
 log_message "Executing: $electron_exec ''${electron_args[*]} $*"
-"$electron_exec" "''${electron_args[@]}" "$@" >> "$log_file" 2>&1
-exit_code=$?
-log_message "Electron exited with code: $exit_code"
-exit $exit_code
+run_electron_and_cleanup "$electron_exec" "''${electron_args[@]}" "$@"
+exit $?
 LAUNCHER
     # Substitute placeholders — electron_exec points to our custom
     # wrapper (which sets GTK/GIO env then execs our merged binary)

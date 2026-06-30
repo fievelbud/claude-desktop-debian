@@ -1,5 +1,26 @@
 # Claude Desktop Debian - Development Notes
 
+<!--
+  This file is read by Claude Code. The content below is duplicated in
+  AGENTS.md (read by other AI tools per the agents.md standard) so that
+  contributors using either receive the same instructions without needing
+  to cross-reference. Keep CLAUDE.md and AGENTS.md byte-identical below
+  the H1 title (the sync-policy comment above is the one place they
+  intentionally differ) — if you edit one, edit the other.
+-->
+
+## Required reading
+
+These documents are the source of truth. If anything in this file conflicts with them, they win. Read them before opening a non-trivial issue or PR.
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — what we accept, what goes upstream, subsystem owners, AI-attribution policy.
+- [`docs/styleguides/bash_styleguide.md`](docs/styleguides/bash_styleguide.md) — shell-script conventions (forked from YSAP). Tabs, 80 cols, `[[ ]]`, no `set -e`, no `eval`.
+- [`docs/styleguides/docs_styleguide.md`](docs/styleguides/docs_styleguide.md) — page anatomy, naming, antipatterns for the `docs/` tree.
+- [`docs/index.md`](docs/index.md) — entry point for the rest of the repo docs.
+- [`SECURITY.md`](SECURITY.md) — vulnerability reporting; what's in scope vs. upstream.
+
+This file is a fast reference for the highest-leverage rules and the project's accumulated archaeology. New policy goes in the style guides or CONTRIBUTING.md.
+
 ## Project Overview
 
 This project repackages Claude Desktop (Electron app) for Debian/Ubuntu Linux, applying necessary patches for Linux compatibility.
@@ -15,16 +36,30 @@ The [`docs/learnings/`](docs/learnings/) directory contains hard-won technical k
 - [`tray-rebuild-race.md`](docs/learnings/tray-rebuild-race.md) — why destroy + recreate on `nativeTheme` updates briefly duplicates the tray icon on KDE Plasma, and the in-place `setImage` + `setContextMenu` fast-path that avoids the SNI re-registration race
 - [`mcp-double-spawn.md`](docs/learnings/mcp-double-spawn.md) — Stdio MCPs spawn 2× when chat and Code/Agent panels are both active, root cause in upstream session managers, MCP-author workaround
 - [`linux-topbar-shim.md`](docs/learnings/linux-topbar-shim.md) — why claude.ai's in-app topbar is missing on Linux, the four gates that hide it, why the upstream `frame:false` + WCO config has unclickable buttons on X11 (Chromium-level implicit drag region), and the resolution: hybrid mode (system frame + UA-spoof shim → stacked layout, full button functionality)
+- [`test-harness-electron-hooks.md`](docs/learnings/test-harness-electron-hooks.md) — why constructor-level `BrowserWindow` wraps are silently bypassed by `frame-fix-wrapper`'s Proxy, and the prototype-method hook pattern that works (used by the Quick Entry test runners)
+- [`test-harness-ax-tree-walker.md`](docs/learnings/test-harness-ax-tree-walker.md) — five non-obvious traps in the v7 fingerprint walker after the AX-tree migration: AX-enable async lag, navigateTo-to-same-URL no-op, claude.ai's flat `dialog>button[]` lists, the `more options for X` per-row shape, and sidebar virtualization vs the lookup-failure threshold
+- [`wayland-global-shortcuts-portal.md`](docs/learnings/wayland-global-shortcuts-portal.md) — why Quick Entry's hotkey is focus-bound on GNOME Wayland (mutter dropped XWayland global key grabs), the native-Wayland + `GlobalShortcutsPortal` launcher change (opt-in via `CLAUDE_USE_WAYLAND=1`; fixes GNOME ≤49, default GNOME stays on XWayland), the "only the last `--enable-features` switch wins → merge into one flag" trap, the tri-state `CLAUDE_USE_WAYLAND` escape hatch, and the proof that GNOME 50 / xdg-desktop-portal ≥1.20 is still blocked upstream because Electron/Chromium never calls the host `Registry.Register` app-id handshake ([electron#51875](https://github.com/electron/electron/issues/51875)); wlroots (Niri/Sway/Hyprland) lack a portal GlobalShortcuts backend entirely
+- [`patching-minified-js.md`](docs/learnings/patching-minified-js.md) — general lessons from maintaining a long-lived patch suite against an actively re-minified upstream: anchor selection (literals over identifiers), the `\w` vs `$` identifier-capture trap, beautified false-negatives, idempotency guards, multi-site coordination, non-unique anchor disambiguation, and the SHA-256-pinned hypothesis-verification recipe
 
 ## Code Style
 
-All shell scripts in this project must follow the [Bash Style Guide](STYLEGUIDE.md). Key points:
+All shell scripts in this project must follow the [Bash Style Guide](docs/styleguides/bash_styleguide.md). Key points:
 
 - Tabs for indentation, lines under 80 characters (exception: URLs and regex patterns)
 - Use `[[ ]]` for conditionals, `$(...)` for command substitution
 - Single quotes for literals, double quotes for expansions
 - Lowercase variables; UPPERCASE only for constants/exports
 - Use `local` in functions, avoid `set -e` and `eval`
+
+### Anti-patterns
+
+- **Don't `set -e`.** It interacts badly with `$(...)` capture and function return values, and the project has historically debugged enough silent exits to settle the question. Check status explicitly: `cmd || handle_err`.
+- **Don't `eval`.** Use arrays for argv composition (`cmd "${args[@]}"`). `eval` defeats every parser and is a permanent SC2046 magnet.
+- **Don't use POSIX `[ ... ]`.** Always `[[ ... ]]`. POSIX `[` mis-parses unquoted expansions in ways `[[` does not.
+- **Don't backtick.** Always `$(...)`. Backticks don't nest cleanly and conflict with markdown when patches are pasted into PR comments.
+- **Don't hardcode the work directory.** Scripts that operate during a build use `$work_dir` (set by `build.sh`). A hardcoded path silently breaks the AppImage build, which runs in a different layout from the deb/rpm builds.
+- **Don't wrap commands in `if cmd; then true; else false; fi`-style scaffolding.** Just `cmd` — the exit code is already there.
+- **Don't append to a baseline file to silence `shellcheck`.** Fix the underlying issue. If a warning is genuinely a false positive, use a per-line `# shellcheck disable=SCXXXX` with a comment explaining why.
 
 ### Linting
 
@@ -36,6 +71,16 @@ Shell scripts are checked with `shellcheck` and GitHub Actions workflows with `a
    - The pattern is intentional and unavoidable
    - Always add a comment explaining why the disable is needed
 3. **Run `/lint` to check manually** - Use this skill to check for issues before pushing
+
+## Docs
+
+- **One declarative sentence then a code block or list at the top of every page.** No "In this guide we will explore…" preamble. See [`docs/styleguides/docs_styleguide.md`](docs/styleguides/docs_styleguide.md).
+- **Lowercase kebab-case filenames** for everything in `docs/`. Order belongs in [`docs/index.md`](docs/index.md), not filenames or numeric prefixes.
+- **Real domain nouns over `foo`/`bar`** in walkthroughs. The project vocabulary is `patches`, `the launcher`, `the worker`, `app.asar`, `the minified bundle`, `the asar archive`, `the doctor surface`.
+- **Subsystem deep-dives go under [`docs/learnings/`](docs/learnings/).** Surfacing knowledge there beats burying it in commit messages or in patch-script comments. Add an entry when you discover something non-obvious that would save the next contributor significant time.
+- **Decisions go in [`docs/decisions.md`](docs/decisions.md) (ADR format).** Don't relitigate a settled direction inside a how-to page; link the decision instead.
+- **Troubleshooting headings are the literal symptom**, not editorialized prose. `## Black screen on Fedora KDE under Wayland`, not `## Troubles with Wayland`. Search ranks headings.
+- **CHANGELOG follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).** Bullets grouped under Added / Fixed / Changed / Deprecated / Removed / Security; one bullet per change; PR link for the deep dive; inline **BREAKING** prefix for breaking changes. See [`CHANGELOG.md`](CHANGELOG.md) for the current state and [`RELEASING.md`](RELEASING.md) for when entries get promoted from `[Unreleased]`.
 
 ## GitHub Workflow
 
@@ -123,7 +168,7 @@ Contributors are listed in chronological order: inspirational projects first (k3
 4. **Extract variable names dynamically** rather than hardcoding them. Shared extraction helpers live in `scripts/patches/_common.sh`. Example:
    ```bash
    # Extract function name from a known pattern
-   TRAY_FUNC=$(grep -oP 'on\("menuBarEnabled",\(\)=>\{\K\w+(?=\(\)\})' app.asar.contents/.vite/build/index.js)
+   TRAY_FUNC=$(grep -oP 'on\("menuBarEnabled",\(\)=>\{\K[$\w]+(?=\(\)\})' app.asar.contents/.vite/build/index.js)
    ```
 
 5. **Handle optional whitespace** in regex patterns:

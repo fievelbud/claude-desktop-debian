@@ -6,6 +6,9 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/test-artifact-common.sh
 source "$script_dir/test-artifact-common.sh"
 
+# Reap an interrupted launch smoke test (see test-artifact-common.sh).
+trap _launch_smoke_cleanup EXIT INT TERM
+
 # Find the .deb file
 deb_file=$(find "$artifact_dir" -name '*.deb' -type f | head -1)
 if [[ -z $deb_file ]]; then
@@ -23,10 +26,16 @@ else
 	fail "Package name is not claude-desktop"
 fi
 
-if [[ $pkg_info == *'Architecture: amd64'* ]]; then
-	pass "Architecture is amd64"
+# Architecture must match the target we built for. TARGET_ARCH is set by
+# the CI workflow's per-arch matrix; fall back to the host's dpkg
+# architecture for standalone/local runs (each CI arch runs on a native
+# runner, so the host arch matches the package arch there too).
+expected_arch="${TARGET_ARCH:-$(dpkg --print-architecture 2>/dev/null)}"
+if [[ -n $expected_arch ]] \
+	&& [[ $pkg_info == *"Architecture: $expected_arch"* ]]; then
+	pass "Architecture is $expected_arch"
 else
-	fail "Architecture is not amd64"
+	fail "Architecture is not ${expected_arch:-<undetermined>}"
 fi
 
 if [[ $pkg_info == *'Version:'* ]]; then
@@ -46,6 +55,8 @@ fi
 # --- File existence checks ---
 assert_executable '/usr/bin/claude-desktop'
 assert_file_exists '/usr/share/applications/claude-desktop.desktop'
+assert_file_exists \
+	'/usr/share/metainfo/io.github.aaddrick.claude-desktop-debian.metainfo.xml'
 assert_dir_exists '/usr/lib/claude-desktop'
 assert_file_exists '/usr/lib/claude-desktop/launcher-common.sh'
 
@@ -56,6 +67,11 @@ assert_executable "$electron_path"
 
 # chrome-sandbox
 assert_file_exists \
+	'/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
+
+# The build's permission normalization clears the setuid bit; postinst
+# must re-assert 4755 or the Electron sandbox breaks silently (#695).
+assert_setuid \
 	'/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
 
 # --- Desktop entry validation ---
@@ -99,6 +115,15 @@ assert_contains '/usr/bin/claude-desktop' 'build_electron_args' \
 resources_dir='/usr/lib/claude-desktop/node_modules/electron/dist/resources'
 validate_app_contents "$resources_dir"
 
+# app.asar.unpacked must be world-traversable and root-owned, or
+# Cowork's auto-launch fs.existsSync() guard silently fails (#695).
+unpacked_stat=$(stat -c '%a %U:%G' "$resources_dir/app.asar.unpacked")
+if [[ $unpacked_stat == '755 root:root' ]]; then
+	pass 'app.asar.unpacked is 755 root:root'
+else
+	fail "app.asar.unpacked is $unpacked_stat (want 755 root:root)"
+fi
+
 # --- Doctor smoke test ---
 # --doctor checks system state; some checks will fail in CI (no display,
 # etc.) but the script itself should not crash with signal or 127.
@@ -109,5 +134,10 @@ if [[ $doctor_exit -lt 127 ]]; then
 else
 	fail "--doctor crashed (exit: $doctor_exit)"
 fi
+
+# --- Headless launch smoke test ---
+# ubuntu-latest runs as a non-root user, so no privilege drop needed.
+run_launch_smoke_test 'deb package' '/usr/lib/claude-desktop' '' \
+	/usr/bin/claude-desktop
 
 print_summary

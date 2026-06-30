@@ -7,6 +7,16 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/test-artifact-common.sh
 source "$script_dir/test-artifact-common.sh"
 
+# Single point of cleanup, set at script scope so any interruption
+# between resource alloc and normal exit is covered. _launch_smoke_cleanup
+# (test-artifact-common.sh) reaps an interrupted launch and its temp dirs;
+# extract_dir is AppImage-specific so it's torn down here.
+_cleanup() {
+	_launch_smoke_cleanup
+	[[ -n ${extract_dir:-} ]] && rm -rf "$extract_dir"
+}
+trap _cleanup EXIT INT TERM
+
 component_id='io.github.aaddrick.claude-desktop-debian'
 
 # Find the AppImage file (exclude .zsync)
@@ -95,6 +105,29 @@ assert_contains "$appdir/AppRun" 'build_electron_args' \
 # --- App contents (asar) ---
 resources_dir="$appdir/usr/lib/node_modules/electron/dist/resources"
 validate_app_contents "$resources_dir" "${component_id}.desktop"
+
+# --- Doctor smoke test ---
+# Some --doctor checks fail in CI (no display, etc.); we only care that
+# the script itself didn't crash via signal or exec failure (>=127).
+doctor_exit=0
+"$appimage_file" --doctor >/dev/null 2>&1 || doctor_exit=$?
+if [[ $doctor_exit -lt 127 ]]; then
+	pass "--doctor runs without crashing (exit: $doctor_exit)"
+else
+	fail "--doctor crashed (exit: $doctor_exit)"
+fi
+
+# --- Headless launch smoke test ---
+# The AppImage runs as the (non-root) CI user, so no privilege drop.
+# The pkill sweep matches 'mount_claude', not the .AppImage path: a running
+# AppImage execs Electron from its FUSE mount (/tmp/.mount_claudeXXXX), so
+# the escaped zygote/electron children live there. Matching the artifact
+# path would sweep nothing. See CLAUDE.md (`pkill -9 -f "mount_claude"`).
+# Sweep escaped children only in CI: locally, 'mount_claude' also
+# matches a developer's live Claude Desktop AppImage session.
+smoke_sweep=''
+[[ -n ${CI:-} ]] && smoke_sweep='mount_claude'
+run_launch_smoke_test 'AppImage' "$smoke_sweep" '' "$appimage_file"
 
 # --- Cleanup ---
 rm -rf "$extract_dir"

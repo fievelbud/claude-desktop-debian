@@ -6,6 +6,16 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tests/test-artifact-common.sh
 source "$script_dir/test-artifact-common.sh"
 
+# Reap an interrupted launch smoke test, then remove the throwaway
+# unprivileged user the launch drops to (see below / test-artifact-
+# common.sh).
+_rpm_cleanup() {
+	_launch_smoke_cleanup
+	[[ -n ${smoke_user:-} ]] \
+		&& userdel -r "$smoke_user" 2>/dev/null
+}
+trap _rpm_cleanup EXIT INT TERM
+
 # Find the .rpm file
 rpm_file=$(find "$artifact_dir" -name '*.rpm' -type f | head -1)
 if [[ -z $rpm_file ]]; then
@@ -33,6 +43,8 @@ fi
 # --- File existence checks ---
 assert_executable '/usr/bin/claude-desktop'
 assert_file_exists '/usr/share/applications/claude-desktop.desktop'
+assert_file_exists \
+	'/usr/share/metainfo/io.github.aaddrick.claude-desktop-debian.metainfo.xml'
 assert_dir_exists '/usr/lib/claude-desktop'
 assert_file_exists '/usr/lib/claude-desktop/launcher-common.sh'
 
@@ -41,9 +53,14 @@ electron_path='/usr/lib/claude-desktop/node_modules/electron/dist/electron'
 assert_file_exists "$electron_path"
 assert_executable "$electron_path"
 
-# chrome-sandbox
-assert_file_exists \
-	'/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
+# chrome-sandbox: setuid bit must be set by the rpm spec's %files
+# %attr(4755, ...) entry, not by a %post chmod (#539). The check
+# guards against any regression that strips the suid bit — including
+# (but not limited to) reverting to a %post chmod, which silently
+# no-ops if the scriptlet is skipped (--noscripts, layered images).
+chrome_sandbox='/usr/lib/claude-desktop/node_modules/electron/dist/chrome-sandbox'
+assert_file_exists "$chrome_sandbox"
+assert_setuid "$chrome_sandbox"
 
 # --- Desktop entry validation ---
 desktop_file='/usr/share/applications/claude-desktop.desktop'
@@ -80,6 +97,15 @@ assert_contains '/usr/bin/claude-desktop' 'build_electron_args' \
 resources_dir='/usr/lib/claude-desktop/node_modules/electron/dist/resources'
 validate_app_contents "$resources_dir"
 
+# app.asar.unpacked must be world-traversable and root-owned, or
+# Cowork's auto-launch fs.existsSync() guard silently fails (#695).
+unpacked_stat=$(stat -c '%a %U:%G' "$resources_dir/app.asar.unpacked")
+if [[ $unpacked_stat == '755 root:root' ]]; then
+	pass 'app.asar.unpacked is 755 root:root'
+else
+	fail "app.asar.unpacked is $unpacked_stat (want 755 root:root)"
+fi
+
 # --- Doctor smoke test ---
 doctor_exit=0
 /usr/bin/claude-desktop --doctor >/dev/null 2>&1 || doctor_exit=$?
@@ -88,5 +114,23 @@ if [[ $doctor_exit -lt 127 ]]; then
 else
 	fail "--doctor crashed (exit: $doctor_exit)"
 fi
+
+# --- Headless launch smoke test ---
+# The container runs as root; Electron aborts as root without
+# --no-sandbox (which the launcher only adds on Wayland/deb), so drop to
+# a throwaway unprivileged user. The install is world-readable and
+# chrome-sandbox is setuid root, so this exercises the real sandbox path
+# a Fedora user hits. The user is removed by the EXIT trap.
+# In a non-root env or without useradd, smoke_user stays empty and the
+# helper runs the launch as-is rather than dropping privileges.
+smoke_user=''
+if [[ $(id -u) -eq 0 ]] && command -v useradd &>/dev/null; then
+	smoke_user='claude-smoke'
+	useradd -m "$smoke_user" 2>/dev/null \
+		|| smoke_user=''
+fi
+
+run_launch_smoke_test 'rpm package' '/usr/lib/claude-desktop' \
+	"$smoke_user" /usr/bin/claude-desktop
 
 print_summary
